@@ -1,0 +1,12 @@
+environment: local
+app_name: algo-trading
+log_level: INFO
+
+initial_capital: 100000.00
+max_positions: 5
+
+database:
+  host: localhost
+  port: 3306
+  name: algo_trading
+  user: algo_trading_app
