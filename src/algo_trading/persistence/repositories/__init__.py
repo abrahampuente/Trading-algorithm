@@ -1,3 +1,6 @@
+from algo_trading.persistence.repositories.adjusted_bar_query_repository import (
+    AdjustedMarketBarQueryRepository,
+)
 from algo_trading.persistence.repositories.adjusted_bar_repository import (
     AdjustedMarketBarRepository,
     DuplicateAdjustedMarketBarError,
@@ -20,4 +23,5 @@ __all__ = [
     "RawMarketBarRepository",
     "RawMarketBarQueryRepository",
     "CorporateActionQueryRepository",
+    "AdjustedMarketBarQueryRepository",
 ]
