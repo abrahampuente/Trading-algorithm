@@ -8,6 +8,31 @@ from algo_trading.persistence.models import Base, CorporateAction, CorporateActi
 from algo_trading.persistence.repositories import CorporateActionQueryRepository
 
 
+def test_get_split_dtos_by_symbol_returns_domain_objects() -> None:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        session.add(
+            build_split(
+                ex_date=date(2024, 1, 1),
+                ratio="2",
+            )
+        )
+        session.commit()
+
+        repository = CorporateActionQueryRepository(session)
+
+        splits = repository.get_split_dtos_by_symbol("AAPL")
+
+        assert len(splits) == 1
+        assert splits[0].symbol == "AAPL"
+        assert splits[0].ratio == Decimal("2")
+        assert splits[0].source == "test"
+
+    engine.dispose()
+
+
 def build_split(
     ex_date: date,
     symbol: str = "AAPL",

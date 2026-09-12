@@ -1,10 +1,10 @@
 from collections.abc import Iterable
-from datetime import UTC, date, datetime
-from decimal import Decimal
+from datetime import UTC, datetime
 
 from algo_trading.data.adjustments.split_adjustment import (
     SplitAdjustmentCalculator,
 )
+from algo_trading.domain.corporate_actions import CorporateSplit
 from algo_trading.persistence.models.adjusted_market_data import (
     MarketBarAdjusted,
 )
@@ -23,10 +23,10 @@ class AdjustedMarketBarBuilder:
     def build(
         self,
         raw_bar: MarketBarRaw,
-        splits: Iterable[tuple[date, Decimal]],
+        splits: Iterable[CorporateSplit],
     ) -> MarketBarAdjusted:
-        split_events = sorted(splits, key=lambda event: event[0])
 
+        split_events = sorted(splits, key=lambda split: split.ex_date)
         factor = SplitAdjustmentCalculator.cumulative_factor_for_bar(
             bar_date=raw_bar.timestamp.date(),
             splits=split_events,

@@ -4,6 +4,7 @@ from decimal import Decimal
 import pytest
 
 from algo_trading.data.adjustments import SplitAdjustmentCalculator
+from algo_trading.domain.corporate_actions import CorporateSplit
 
 
 def test_split_adjusts_bars_before_ex_date() -> None:
@@ -63,8 +64,18 @@ def test_cumulative_factor_for_multiple_splits() -> None:
     factor = SplitAdjustmentCalculator.cumulative_factor_for_bar(
         bar_date=date(2020, 1, 1),
         splits=[
-            (date(2021, 1, 2), Decimal("2")),
-            (date(2022, 1, 2), Decimal("3")),
+            CorporateSplit(
+                symbol="AAPL",
+                ex_date=date(2021, 1, 2),
+                ratio=Decimal("2"),
+                source="test",
+            ),
+            CorporateSplit(
+                symbol="AAPL",
+                ex_date=date(2022, 1, 2),
+                ratio=Decimal("3"),
+                source="test",
+            ),
         ],
     )
 
@@ -75,9 +86,24 @@ def test_cumulative_factor_ignores_splits_before_or_on_bar_date() -> None:
     factor = SplitAdjustmentCalculator.cumulative_factor_for_bar(
         bar_date=date(2022, 1, 2),
         splits=[
-            (date(2021, 1, 2), Decimal("2")),
-            (date(2022, 1, 2), Decimal("3")),
-            (date(2023, 1, 2), Decimal("5")),
+            CorporateSplit(
+                symbol="AAPL",
+                ex_date=date(2021, 1, 2),
+                ratio=Decimal("2"),
+                source="test",
+            ),
+            CorporateSplit(
+                symbol="AAPL",
+                ex_date=date(2022, 1, 2),
+                ratio=Decimal("3"),
+                source="test",
+            ),
+            CorporateSplit(
+                symbol="AAPL",
+                ex_date=date(2023, 1, 2),
+                ratio=Decimal("5"),
+                source="test",
+            ),
         ],
     )
 
@@ -85,10 +111,15 @@ def test_cumulative_factor_ignores_splits_before_or_on_bar_date() -> None:
 
 
 def test_cumulative_factor_rejects_invalid_ratio() -> None:
-    with pytest.raises(ValueError, match="split_ratio"):
+    with pytest.raises(ValueError, match="ratio"):
         SplitAdjustmentCalculator.cumulative_factor_for_bar(
             bar_date=date(2020, 1, 1),
             splits=[
-                (date(2021, 1, 2), Decimal("0")),
+                CorporateSplit(
+                    symbol="AAPL",
+                    ex_date=date(2021, 1, 2),
+                    ratio=Decimal("0"),
+                    source="test",
+                ),
             ],
         )

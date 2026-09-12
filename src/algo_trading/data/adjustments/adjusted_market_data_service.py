@@ -1,12 +1,11 @@
 from collections.abc import Iterable, Sequence
-from datetime import date
-from decimal import Decimal
 
 from sqlalchemy.orm import Session
 
 from algo_trading.data.adjustments.adjusted_bar_builder import (
     AdjustedMarketBarBuilder,
 )
+from algo_trading.domain.corporate_actions import CorporateSplit
 from algo_trading.persistence.models.adjusted_market_data import (
     MarketBarAdjusted,
 )
@@ -31,7 +30,7 @@ class AdjustedMarketDataService:
     def build_and_persist(
         self,
         raw_bars: Sequence[MarketBarRaw],
-        splits_by_symbol: dict[str, Iterable[tuple[date, Decimal]]],
+        splits_by_symbol: dict[str, Iterable[CorporateSplit]],
     ) -> int:
         """
         Construye y persiste barras ajustadas en una única transacción.

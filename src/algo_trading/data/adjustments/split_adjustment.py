@@ -2,6 +2,8 @@ from collections.abc import Iterable
 from datetime import date
 from decimal import Decimal
 
+from algo_trading.domain.corporate_actions import CorporateSplit
+
 
 class SplitAdjustmentCalculator:
     """Calcula factores históricos de ajuste por splits."""
@@ -49,24 +51,16 @@ class SplitAdjustmentCalculator:
     @staticmethod
     def cumulative_factor_for_bar(
         bar_date: date,
-        splits: Iterable[tuple[date, Decimal]],
+        splits: Iterable[CorporateSplit],
     ) -> Decimal:
-        """
-        Calcula el factor acumulado de todos los splits posteriores a la barra.
-
-        Cada elemento de splits debe ser:
-            (ex_date, split_ratio)
-
-        Por ejemplo, un split 2:1 se representa como:
-            (date(2024, 1, 2), Decimal("2"))
-        """
+        """Calcula el factor acumulado de splits posteriores a la barra."""
         factor = Decimal("1")
 
-        for ex_date, split_ratio in splits:
-            if split_ratio <= Decimal("0"):
-                raise ValueError("split_ratio debe ser mayor que cero")
+        for split in splits:
+            if split.ratio <= Decimal("0"):
+                raise ValueError("split ratio debe ser mayor que cero")
 
-            if bar_date < ex_date:
-                factor /= split_ratio
+            if bar_date < split.ex_date:
+                factor /= split.ratio
 
         return factor

@@ -2,6 +2,7 @@ from datetime import date, datetime
 from decimal import Decimal
 
 from algo_trading.data.adjustments import AdjustedMarketBarBuilder
+from algo_trading.domain.corporate_actions import CorporateSplit
 from algo_trading.persistence.models.market_data import MarketBarRaw
 
 
@@ -25,9 +26,17 @@ def test_build_adjusted_bar_with_split() -> None:
     adjusted_bar = builder.build(
         raw_bar=build_raw_bar(),
         splits=[
-            (date(2021, 1, 2), Decimal("2")),
+            CorporateSplit(
+                symbol="AAPL",
+                ex_date=date(2021, 1, 2),
+                ratio=Decimal("2"),
+                source="test",
+            ),
         ],
     )
+
+    assert adjusted_bar.close == Decimal("51.5")
+    assert adjusted_bar.volume == Decimal("2000000")
 
     assert adjusted_bar.symbol == "AAPL"
     assert adjusted_bar.open == Decimal("50")
@@ -45,7 +54,12 @@ def test_build_bar_without_applicable_split() -> None:
     adjusted_bar = builder.build(
         raw_bar=build_raw_bar(),
         splits=[
-            (date(2019, 1, 2), Decimal("2")),
+            CorporateSplit(
+                symbol="AAPL",
+                ex_date=date(2019, 1, 2),
+                ratio=Decimal("2"),
+                source="test",
+            ),
         ],
     )
 

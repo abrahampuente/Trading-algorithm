@@ -5,6 +5,7 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
 from algo_trading.data.adjustments import AdjustedMarketDataService
+from algo_trading.domain.corporate_actions import CorporateSplit
 from algo_trading.persistence.models import Base, MarketBarAdjusted, MarketBarRaw
 
 
@@ -36,7 +37,12 @@ def test_service_builds_and_persists_adjusted_bars() -> None:
             raw_bars=[build_raw_bar()],
             splits_by_symbol={
                 "AAPL": [
-                    (date(2021, 1, 2), Decimal("2")),
+                    CorporateSplit(
+                        symbol="AAPL",
+                        ex_date=date(2021, 1, 2),
+                        ratio=Decimal("2"),
+                        source="test",
+                    ),
                 ],
             },
         )
