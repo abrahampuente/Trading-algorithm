@@ -1,7 +1,5 @@
 # Estado del proyecto — Algo Trading
 
-# Estado del proyecto — Algo Trading
-
 ## 1. Propósito
 
 Construir un sistema modular de trading algorítmico Long para activos líquidos, orientado a investigación y backtesting reproducible.
@@ -226,6 +224,7 @@ src/algo_trading/
 ├── config/
 ├── data/
 │   ├── adjustments/
+│   ├── providers/
 │   └── validation/
 ├── domain/
 │   └── corporate_actions/
@@ -289,6 +288,7 @@ Migraciones aplicadas:
 market_bars_raw
 corporate_actions
 market_bars_adjusted
+data_snapshots
 ```
 
 Restricciones relevantes:
@@ -339,6 +339,22 @@ Implementado:
 - Repositorio de lectura de barras raw.
 - Repositorio de lectura de barras adjusted.
 
+### Proveedores de datos y snapshots
+
+Implementado:
+
+- Contrato `MarketDataProvider` mediante `Protocol`.
+- DTOs `DataRequest`, `CorporateActionRequest`, `DataSnapshot` y `MarketDataSnapshot`.
+- `InMemoryMarketDataProvider` para pruebas.
+- Validación interna de snapshots: conteos, `source`, `timeframe` y duplicados.
+- Tabla `data_snapshots` y repositorio de escritura/consulta.
+- Repositorio de escritura para `CorporateAction`.
+- `MarketDataSnapshotPersistenceService` con persistencia atómica de snapshot, barras raw y acciones corporativas.
+- `MarketDataSnapshotIngestionService` que obtiene, valida y persiste snapshots desde un proveedor.
+- Trazabilidad mediante `snapshot_id` opcional en `market_bars_raw` y `corporate_actions`.
+- Consultas de barras raw y acciones corporativas por `snapshot_id`.
+- Pruebas unitarias e integraciones contra MySQL para proveedor, snapshots, persistencia, rollback y trazabilidad.
+
 ---
 
 ## 8. Archivos importantes
@@ -359,6 +375,7 @@ src/algo_trading/persistence/models/base.py
 src/algo_trading/persistence/models/market_data.py
 src/algo_trading/persistence/models/corporate_actions.py
 src/algo_trading/persistence/models/adjusted_market_data.py
+src/algo_trading/persistence/models/data_snapshot.py
 ```
 
 ### Migraciones
@@ -378,6 +395,11 @@ src/algo_trading/data/validation/market_bar_validator.py
 src/algo_trading/data/adjustments/split_adjustment.py
 src/algo_trading/data/adjustments/adjusted_bar_builder.py
 src/algo_trading/data/adjustments/adjusted_market_data_service.py
+src/algo_trading/data/market_data_snapshot_persistence_service.py
+src/algo_trading/data/market_data_snapshot_ingestion_service.py
+src/algo_trading/data/providers/dto.py
+src/algo_trading/data/providers/protocol.py
+src/algo_trading/data/providers/in_memory.py
 ```
 
 ### Dominio
@@ -395,6 +417,8 @@ src/algo_trading/persistence/repositories/market_bar_query_repository.py
 src/algo_trading/persistence/repositories/adjusted_bar_repository.py
 src/algo_trading/persistence/repositories/adjusted_bar_query_repository.py
 src/algo_trading/persistence/repositories/corporate_action_query_repository.py
+src/algo_trading/persistence/repositories/corporate_action_repository.py
+src/algo_trading/persistence/repositories/data_snapshot_repository.py
 ```
 
 ---
@@ -509,21 +533,18 @@ Falta implementar:
 
 ### 11.3 Proveedor de datos
 
+Implementado:
+
+- `MarketDataProvider` como contrato estable.
+- DTOs de solicitudes y snapshots.
+- Proveedor `InMemoryMarketDataProvider` para pruebas.
+- Ingesta, validación, persistencia atómica y trazabilidad de snapshots.
+
 Pendiente:
 
-```text
-MarketDataProvider
-```
-
-Debe abstraer:
-
-- Descarga de barras diarias.
-- Descarga de barras intradía.
-- Descarga de splits.
-- Descarga de dividendos.
-- Identificación de fuente.
-- Rango temporal.
-- Timeframe.
+- Implementar un proveedor externo real detrás del contrato.
+- Definir el algoritmo de `checksum` reproducible para snapshots.
+- Decidir la política de reintentos, rate limits y errores transitorios del proveedor real.
 
 ### 11.4 Datos intradía
 
@@ -579,18 +600,16 @@ EquitySnapshot
 
 ## 12. Próximo orden de implementación
 
-El siguiente módulo recomendado es el adaptador abstracto de proveedores de datos.
+El contrato de proveedores, los snapshots, la persistencia atómica y la trazabilidad ya están implementados.
 
 Orden inmediato:
 
-1. Crear `MarketDataProvider` como protocolo o clase abstracta.
-2. Definir DTOs para barras diarias e intradía.
-3. Definir DTOs para splits y dividendos descargados.
-4. Implementar un proveedor fake/in-memory para pruebas.
-5. Implementar validación de snapshots.
-6. Añadir persistencia de `data_snapshot`.
-7. Integrar el proveedor con `IngestionService`.
-8. Implementar el proveedor real después de estabilizar el contrato.
+1. Revisar y confirmar la semántica temporal de rangos: actualmente las barras se filtran con límites inclusivos (`start <= timestamp <= end`) y las corporate actions también.
+2. Definir un algoritmo reproducible de `checksum` para `DataSnapshot`.
+3. Documentar la convención de `snapshot_id` y su política de idempotencia.
+4. Añadir DTO de lectura para dividendos en `CorporateActionQueryRepository`.
+5. Diseñar el adaptador del proveedor externo real sin conectarlo todavía a la estrategia.
+6. Decidir proveedor y granularidad intradía antes de implementar su adaptador.
 
 No conectar todavía un proveedor externo directamente a la estrategia.
 
@@ -607,9 +626,9 @@ Python: 3.13.3
 Sistema operativo: Windows 11
 IDE: VS Code
 Base de datos: MySQL 8.0 mediante Docker Compose
-Estado: infraestructura, persistencia raw, corporate actions, adjusted data y tests implementados
-Validaciones: pytest, ruff y mypy deben estar en verde
-Siguiente tarea: diseñar MarketDataProvider y los DTOs de snapshots de datos
+Estado: infraestructura, persistencia raw, corporate actions, adjusted data, contrato de proveedores, snapshots, trazabilidad y tests implementados
+Validaciones: pytest, ruff y mypy están en verde
+Siguiente tarea: definir checksum e idempotencia de `DataSnapshot`, y completar DTOs de lectura de dividendos
 Fuente de verdad: docs/project-status.md
 ```
 
@@ -623,8 +642,8 @@ ruff format --check .
 mypy src
 ```
 
-No regenerar módulos ya implementados. Continuar desde el contrato de proveedores de datos.
+No regenerar módulos ya implementados. Continuar desde snapshots, trazabilidad y el contrato de proveedores de datos.
 
 Al abrir el siguiente chat, bastará con indicar:
 
-> Este proyecto continúa desde `docs/project-status.md`. Lee ese estado y no regeneres módulos ya implementados. El siguiente paso es diseñar `MarketDataProvider` y los DTOs de snapshots de datos.
+> Este proyecto continúa desde `docs/project-status.md`. Lee ese estado y no regeneres módulos ya implementados. El siguiente paso es definir el `checksum` e idempotencia de `DataSnapshot`, y completar los DTOs de lectura de dividendos.

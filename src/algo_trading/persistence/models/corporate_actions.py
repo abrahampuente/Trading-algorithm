@@ -2,7 +2,16 @@ from datetime import UTC, date, datetime
 from decimal import Decimal
 from enum import StrEnum
 
-from sqlalchemy import Date, DateTime, Index, Integer, Numeric, String, UniqueConstraint
+from sqlalchemy import (
+    Date,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    Numeric,
+    String,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from algo_trading.persistence.models.base import Base
@@ -35,6 +44,12 @@ class CorporateAction(Base):
     )
 
     source: Mapped[str] = mapped_column(String(64), nullable=False)
+    snapshot_id: Mapped[str | None] = mapped_column(
+        String(128),
+        ForeignKey("data_snapshots.snapshot_id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+
     announced_at: Mapped[datetime | None] = mapped_column(
         DateTime,
         nullable=True,

@@ -17,8 +17,14 @@ from algo_trading.domain.corporate_actions.dto import (
 from algo_trading.persistence.models.corporate_actions import CorporateAction
 from algo_trading.persistence.models.data_snapshot import DataSnapshotModel
 from algo_trading.persistence.models.market_data import MarketBarRaw
+from algo_trading.persistence.repositories.corporate_action_query_repository import (
+    CorporateActionQueryRepository,
+)
 from algo_trading.persistence.repositories.data_snapshot_repository import (
     DuplicateDataSnapshotError,
+)
+from algo_trading.persistence.repositories.market_bar_query_repository import (
+    RawMarketBarQueryRepository,
 )
 
 DATABASE_URL = (
@@ -92,6 +98,14 @@ def test_persists_complete_market_data_snapshot_atomically() -> None:
         service = MarketDataSnapshotPersistenceService(session)
         service.persist(build_snapshot())
 
+        raw_bar_query_repository = RawMarketBarQueryRepository(session)
+        corporate_action_query_repository = CorporateActionQueryRepository(session)
+
+        snapshot_bars = raw_bar_query_repository.get_by_snapshot_id(SNAPSHOT_ID)
+        snapshot_actions = corporate_action_query_repository.get_by_snapshot_id(
+            SNAPSHOT_ID
+        )
+
         persisted_snapshot = session.scalar(
             select(DataSnapshotModel).where(
                 DataSnapshotModel.snapshot_id == SNAPSHOT_ID
@@ -114,8 +128,18 @@ def test_persists_complete_market_data_snapshot_atomically() -> None:
 
         assert persisted_bar is not None
         assert persisted_bar.close == Decimal("103.00000000")
+        assert persisted_bar.snapshot_id == SNAPSHOT_ID
+
+        assert len(snapshot_bars) == 1
+        assert snapshot_bars[0].symbol == "AAPL"
+        assert snapshot_bars[0].snapshot_id == SNAPSHOT_ID
 
         assert len(persisted_actions) == 2
+        assert all(action.snapshot_id == SNAPSHOT_ID for action in persisted_actions)
+
+        assert len(snapshot_actions) == 2
+        assert all(action.symbol == "AAPL" for action in snapshot_actions)
+        assert all(action.snapshot_id == SNAPSHOT_ID for action in snapshot_actions)
 
         clean_test_data(session)
 

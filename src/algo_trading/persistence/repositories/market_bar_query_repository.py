@@ -37,3 +37,19 @@ class RawMarketBarQueryRepository:
             statement = statement.where(MarketBarRaw.source == source)
 
         return self._session.scalars(statement).all()
+
+    def get_by_snapshot_id(
+        self,
+        snapshot_id: str,
+    ) -> Sequence[MarketBarRaw]:
+        """Obtiene las barras raw pertenecientes a un snapshot."""
+        statement = (
+            select(MarketBarRaw)
+            .where(MarketBarRaw.snapshot_id == snapshot_id)
+            .order_by(
+                MarketBarRaw.symbol,
+                MarketBarRaw.timestamp,
+            )
+        )
+
+        return self._session.scalars(statement).all()

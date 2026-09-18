@@ -17,15 +17,23 @@ class RawMarketBarRepository:
     def __init__(self, session: Session) -> None:
         self._session = session
 
-    def add(self, bar: MarketBar) -> MarketBarRaw:
+    def add(
+        self,
+        bar: MarketBar,
+        snapshot_id: str | None = None,
+    ) -> MarketBarRaw:
         """Añade una barra a la sesión sin confirmar la transacción."""
-        entity = self._to_entity(bar)
+        entity = self._to_entity(bar, snapshot_id=snapshot_id)
         self._session.add(entity)
         return entity
 
-    def add_many(self, bars: Sequence[MarketBar]) -> list[MarketBarRaw]:
+    def add_many(
+        self,
+        bars: Sequence[MarketBar],
+        snapshot_id: str | None = None,
+    ) -> list[MarketBarRaw]:
         """Añade varias barras a la sesión sin confirmar la transacción."""
-        entities = [self._to_entity(bar) for bar in bars]
+        entities = [self._to_entity(bar, snapshot_id=snapshot_id) for bar in bars]
         self._session.add_all(entities)
         return entities
 
@@ -45,12 +53,16 @@ class RawMarketBarRepository:
             ) from error
 
     @staticmethod
-    def _to_entity(bar: MarketBar) -> MarketBarRaw:
+    def _to_entity(
+        bar: MarketBar,
+        snapshot_id: str | None = None,
+    ) -> MarketBarRaw:
         return MarketBarRaw(
             symbol=bar.symbol,
             timestamp=bar.timestamp.replace(tzinfo=None),
             timeframe=bar.timeframe,
             source=bar.source,
+            snapshot_id=snapshot_id,
             open=bar.open,
             high=bar.high,
             low=bar.low,

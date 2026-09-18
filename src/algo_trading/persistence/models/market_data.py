@@ -1,7 +1,15 @@
 from datetime import UTC, datetime
 from decimal import Decimal
 
-from sqlalchemy import DateTime, Index, Integer, Numeric, String, UniqueConstraint
+from sqlalchemy import (
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    Numeric,
+    String,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from algo_trading.persistence.models.base import Base
@@ -16,6 +24,11 @@ class MarketBarRaw(Base):
     timestamp: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     timeframe: Mapped[str] = mapped_column(String(16), nullable=False)
     source: Mapped[str] = mapped_column(String(64), nullable=False)
+    snapshot_id: Mapped[str | None] = mapped_column(
+        String(128),
+        ForeignKey("data_snapshots.snapshot_id", ondelete="RESTRICT"),
+        nullable=True,
+    )
 
     open: Mapped[Decimal] = mapped_column(Numeric(20, 8), nullable=False)
     high: Mapped[Decimal] = mapped_column(Numeric(20, 8), nullable=False)

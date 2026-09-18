@@ -25,18 +25,25 @@ class CorporateActionRepository:
     def __init__(self, session: Session) -> None:
         self._session = session
 
-    def add(self, action: CorporateActionDto) -> CorporateAction:
+    def add(
+        self,
+        action: CorporateActionDto,
+        snapshot_id: str | None = None,
+    ) -> CorporateAction:
         """Añade una acción corporativa sin confirmar la transacción."""
-        entity = self._to_entity(action)
+        entity = self._to_entity(action, snapshot_id=snapshot_id)
         self._session.add(entity)
         return entity
 
     def add_many(
         self,
         actions: Sequence[CorporateActionDto],
+        snapshot_id: str | None = None,
     ) -> list[CorporateAction]:
         """Añade varias acciones corporativas sin confirmar la transacción."""
-        entities = [self._to_entity(action) for action in actions]
+        entities = [
+            self._to_entity(action, snapshot_id=snapshot_id) for action in actions
+        ]
         self._session.add_all(entities)
         return entities
 
@@ -56,7 +63,10 @@ class CorporateActionRepository:
             ) from error
 
     @staticmethod
-    def _to_entity(action: CorporateActionDto) -> CorporateAction:
+    def _to_entity(
+        action: CorporateActionDto,
+        snapshot_id: str | None = None,
+    ) -> CorporateAction:
         if isinstance(action, CorporateSplit):
             return CorporateAction(
                 symbol=action.symbol,
@@ -65,9 +75,9 @@ class CorporateActionRepository:
                 split_ratio=action.ratio,
                 dividend_amount=None,
                 source=action.source,
+                snapshot_id=snapshot_id,
                 announced_at=None,
             )
-
         return CorporateAction(
             symbol=action.symbol,
             action_type=CorporateActionType.DIVIDEND,
@@ -75,5 +85,6 @@ class CorporateActionRepository:
             split_ratio=None,
             dividend_amount=action.amount,
             source=action.source,
+            snapshot_id=snapshot_id,
             announced_at=None,
         )

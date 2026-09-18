@@ -78,3 +78,19 @@ class CorporateActionQueryRepository:
             splits.append(domain_action)
 
         return splits
+
+    def get_by_snapshot_id(
+        self,
+        snapshot_id: str,
+    ) -> Sequence[CorporateAction]:
+        """Obtiene las acciones corporativas pertenecientes a un snapshot."""
+        statement = (
+            select(CorporateAction)
+            .where(CorporateAction.snapshot_id == snapshot_id)
+            .order_by(
+                CorporateAction.symbol,
+                CorporateAction.ex_date,
+                CorporateAction.action_type,
+            )
+        )
+        return self._session.scalars(statement).all()

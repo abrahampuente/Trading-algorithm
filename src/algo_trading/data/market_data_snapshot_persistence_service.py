@@ -42,10 +42,17 @@ class MarketDataSnapshotPersistenceService:
 
         try:
             self._snapshot_repository.add(snapshot.metadata)
-            self._bar_repository.add_many(validated_bars)
-            self._corporate_action_repository.add_many(corporate_actions)
-
             self._snapshot_repository.flush()
+
+            self._bar_repository.add_many(
+                validated_bars,
+                snapshot_id=snapshot.metadata.snapshot_id,
+            )
+            self._corporate_action_repository.add_many(
+                corporate_actions,
+                snapshot_id=snapshot.metadata.snapshot_id,
+            )
+
             self._bar_repository.flush()
             self._corporate_action_repository.flush()
 

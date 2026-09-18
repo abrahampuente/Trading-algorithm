@@ -8,6 +8,8 @@ from algo_trading.data.market_bar import MarketBar
 from algo_trading.data.providers.dto import (
     CorporateActionRequest,
     DataRequest,
+    DataSnapshot,
+    MarketDataSnapshot,
 )
 from algo_trading.data.providers.in_memory import InMemoryMarketDataProvider
 from algo_trading.domain.corporate_actions.dto import CorporateDividend
@@ -86,4 +88,66 @@ def test_rejects_invalid_date_range() -> None:
             end=datetime(2025, 1, 1, tzinfo=UTC),
             timeframe="1d",
             source="fake",
+        )
+
+
+def test_rejects_snapshot_with_bar_from_another_source() -> None:
+    bar = MarketBar(
+        symbol="AAA",
+        timestamp=datetime(2025, 1, 2, tzinfo=UTC),
+        timeframe="1d",
+        source="another-source",
+        open=Decimal("10"),
+        high=Decimal("11"),
+        low=Decimal("9"),
+        close=Decimal("10.5"),
+        volume=Decimal("1000"),
+    )
+
+    metadata = DataSnapshot(
+        snapshot_id="snapshot-source-validation",
+        source="fake",
+        retrieved_at=datetime(2025, 1, 3, tzinfo=UTC),
+        timeframe="1d",
+        bars_count=1,
+        splits_count=0,
+        dividends_count=0,
+        checksum="test-checksum",
+    )
+
+    with pytest.raises(ValidationError, match="source del snapshot"):
+        MarketDataSnapshot(
+            metadata=metadata,
+            bars=(bar,),
+        )
+
+
+def test_rejects_snapshot_with_duplicate_bars() -> None:
+    bar = MarketBar(
+        symbol="AAA",
+        timestamp=datetime(2025, 1, 2, tzinfo=UTC),
+        timeframe="1d",
+        source="fake",
+        open=Decimal("10"),
+        high=Decimal("11"),
+        low=Decimal("9"),
+        close=Decimal("10.5"),
+        volume=Decimal("1000"),
+    )
+
+    metadata = DataSnapshot(
+        snapshot_id="snapshot-duplicate-bars",
+        source="fake",
+        retrieved_at=datetime(2025, 1, 3, tzinfo=UTC),
+        timeframe="1d",
+        bars_count=2,
+        splits_count=0,
+        dividends_count=0,
+        checksum="test-checksum",
+    )
+
+    with pytest.raises(ValidationError, match="barras duplicadas"):
+        MarketDataSnapshot(
+            metadata=metadata,
+            bars=(bar, bar),
         )

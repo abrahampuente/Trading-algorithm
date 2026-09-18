@@ -73,11 +73,72 @@ class MarketDataSnapshot(BaseModel):
     dividends: tuple[CorporateDividend, ...] = ()
 
     @model_validator(mode="after")
-    def validate_counts(self) -> Self:
+    def validate_snapshot(self) -> Self:
         if self.metadata.bars_count != len(self.bars):
             raise ValueError("bars_count no coincide con el número de barras")
+
         if self.metadata.splits_count != len(self.splits):
             raise ValueError("splits_count no coincide con el número de splits")
+
         if self.metadata.dividends_count != len(self.dividends):
             raise ValueError("dividends_count no coincide con el número de dividendos")
+
+        self._validate_bar_sources()
+        self._validate_split_sources()
+        self._validate_dividend_sources()
+        self._validate_duplicate_bars()
+        self._validate_duplicate_splits()
+        self._validate_duplicate_dividends()
+
         return self
+
+    def _validate_bar_sources(self) -> None:
+        for bar in self.bars:
+            if bar.source != self.metadata.source:
+                raise ValueError(
+                    "Todas las barras deben utilizar el source del snapshot"
+                )
+
+            if bar.timeframe != self.metadata.timeframe:
+                raise ValueError(
+                    "Todas las barras deben utilizar el timeframe del snapshot"
+                )
+
+    def _validate_split_sources(self) -> None:
+        for split in self.splits:
+            if split.source != self.metadata.source:
+                raise ValueError(
+                    "Todos los splits deben utilizar el source del snapshot"
+                )
+
+    def _validate_dividend_sources(self) -> None:
+        for dividend in self.dividends:
+            if dividend.source != self.metadata.source:
+                raise ValueError(
+                    "Todos los dividendos deben utilizar el source del snapshot"
+                )
+
+    def _validate_duplicate_bars(self) -> None:
+        identities = {
+            (bar.symbol, bar.timestamp, bar.timeframe, bar.source) for bar in self.bars
+        }
+
+        if len(identities) != len(self.bars):
+            raise ValueError("El snapshot contiene barras duplicadas")
+
+    def _validate_duplicate_splits(self) -> None:
+        identities = {
+            (split.symbol, split.ex_date, split.source) for split in self.splits
+        }
+
+        if len(identities) != len(self.splits):
+            raise ValueError("El snapshot contiene splits duplicados")
+
+    def _validate_duplicate_dividends(self) -> None:
+        identities = {
+            (dividend.symbol, dividend.ex_date, dividend.source)
+            for dividend in self.dividends
+        }
+
+        if len(identities) != len(self.dividends):
+            raise ValueError("El snapshot contiene dividendos duplicados")
