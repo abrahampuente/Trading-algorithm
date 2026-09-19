@@ -56,9 +56,7 @@ class MarketDataSnapshotIngestionService:
             corporate_action_request=corporate_action_request,
         )
 
-        self._persistence_service.persist(snapshot)
-
-        return snapshot.metadata
+        return self._persistence_service.persist(snapshot)
 
     @staticmethod
     def _validate_requests(

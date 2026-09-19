@@ -12,6 +12,9 @@ from algo_trading.data.providers.dto import (
     MarketDataSnapshot,
 )
 from algo_trading.data.providers.in_memory import InMemoryMarketDataProvider
+from algo_trading.data.providers.snapshot_checksum import (
+    calculate_snapshot_checksum,
+)
 from algo_trading.domain.corporate_actions.dto import CorporateDividend
 
 
@@ -78,6 +81,11 @@ def test_builds_snapshot_with_consistent_counts(
 
     assert snapshot.metadata.bars_count == 1
     assert snapshot.metadata.dividends_count == 1
+    assert snapshot.metadata.checksum == calculate_snapshot_checksum(
+        bars=snapshot.bars,
+        splits=snapshot.splits,
+        dividends=snapshot.dividends,
+    )
 
 
 def test_rejects_invalid_date_range() -> None:

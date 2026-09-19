@@ -4,6 +4,7 @@ from decimal import Decimal
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
+from algo_trading.domain.corporate_actions.dto import CorporateDividend
 from algo_trading.persistence.models import Base, CorporateAction, CorporateActionType
 from algo_trading.persistence.repositories import CorporateActionQueryRepository
 
@@ -109,5 +110,40 @@ def test_get_splits_filters_by_half_open_date_range_and_source() -> None:
             date(2024, 1, 1),
             date(2024, 2, 1),
         ]
+
+    engine.dispose()
+
+
+def test_get_dividend_dtos_by_symbol_returns_domain_dtos() -> None:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        session.add(
+            CorporateAction(
+                symbol="AAPL",
+                action_type=CorporateActionType.DIVIDEND,
+                ex_date=date(2024, 2, 15),
+                split_ratio=None,
+                dividend_amount=Decimal("0.24"),
+                source="test-source",
+                announced_at=None,
+            )
+        )
+        session.commit()
+
+        repository = CorporateActionQueryRepository(session)
+
+        result = repository.get_dividend_dtos_by_symbol(
+            symbol="AAPL",
+            source="test-source",
+        )
+
+        assert len(result) == 1
+        assert isinstance(result[0], CorporateDividend)
+        assert result[0].symbol == "AAPL"
+        assert result[0].ex_date == date(2024, 2, 15)
+        assert result[0].amount == Decimal("0.24")
+        assert result[0].source == "test-source"
 
     engine.dispose()

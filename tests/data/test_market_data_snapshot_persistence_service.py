@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 from algo_trading.data.market_bar import MarketBar
 from algo_trading.data.market_data_snapshot_persistence_service import (
     MarketDataSnapshotPersistenceService,
+    SnapshotContentConflictError,
 )
 from algo_trading.data.providers.dto import DataSnapshot, MarketDataSnapshot
 from algo_trading.domain.corporate_actions.dto import (
@@ -19,9 +20,6 @@ from algo_trading.persistence.models.data_snapshot import DataSnapshotModel
 from algo_trading.persistence.models.market_data import MarketBarRaw
 from algo_trading.persistence.repositories.corporate_action_query_repository import (
     CorporateActionQueryRepository,
-)
-from algo_trading.persistence.repositories.data_snapshot_repository import (
-    DuplicateDataSnapshotError,
 )
 from algo_trading.persistence.repositories.market_bar_query_repository import (
     RawMarketBarQueryRepository,
@@ -146,17 +144,54 @@ def test_persists_complete_market_data_snapshot_atomically() -> None:
     engine.dispose()
 
 
-def test_rolls_back_all_data_when_snapshot_already_exists() -> None:
+def test_is_idempotent_when_snapshot_id_and_checksum_are_equal() -> None:
     engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 
     with Session(engine) as session:
         clean_test_data(session)
 
         service = MarketDataSnapshotPersistenceService(session)
-        service.persist(build_snapshot())
+        first_metadata = service.persist(build_snapshot())
+        retry_metadata = service.persist(build_snapshot())
 
-        with pytest.raises(DuplicateDataSnapshotError):
-            service.persist(build_snapshot())
+        persisted_bars = session.scalars(
+            select(MarketBarRaw).where(MarketBarRaw.source == SOURCE)
+        ).all()
+        persisted_actions = session.scalars(
+            select(CorporateAction).where(CorporateAction.source == SOURCE)
+        ).all()
+
+        assert retry_metadata == first_metadata
+        assert len(persisted_bars) == 1
+        assert len(persisted_actions) == 2
+
+        clean_test_data(session)
+
+    engine.dispose()
+
+
+def test_rejects_existing_snapshot_id_with_different_checksum() -> None:
+    engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+
+    with Session(engine) as session:
+        clean_test_data(session)
+
+        service = MarketDataSnapshotPersistenceService(session)
+        original_snapshot = build_snapshot()
+        service.persist(original_snapshot)
+
+        conflicting_metadata = original_snapshot.metadata.model_copy(
+            update={"checksum": "different-checksum"}
+        )
+        conflicting_snapshot = original_snapshot.model_copy(
+            update={"metadata": conflicting_metadata}
+        )
+
+        with pytest.raises(
+            SnapshotContentConflictError,
+            match="checksum diferente",
+        ):
+            service.persist(conflicting_snapshot)
 
         persisted_bars = session.scalars(
             select(MarketBarRaw).where(MarketBarRaw.source == SOURCE)

@@ -53,7 +53,14 @@ def test_persists_and_retrieves_data_snapshot() -> None:
         assert persisted_snapshot is not None
         assert persisted_snapshot.snapshot_id == SNAPSHOT_ID
         assert persisted_snapshot.source == "integration-test"
-        assert persisted_snapshot.retrieved_at == datetime(2024, 1, 31, 22, 0)
+        assert persisted_snapshot.retrieved_at == datetime(
+            2024,
+            1,
+            31,
+            22,
+            0,
+            tzinfo=UTC,
+        )
         assert persisted_snapshot.timeframe == "1d"
         assert persisted_snapshot.bars_count == 20
         assert persisted_snapshot.splits_count == 1

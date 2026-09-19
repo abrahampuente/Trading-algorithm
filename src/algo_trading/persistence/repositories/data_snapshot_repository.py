@@ -1,3 +1,5 @@
+from datetime import UTC
+
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -68,7 +70,7 @@ class DataSnapshotRepository:
         return DataSnapshot(
             snapshot_id=entity.snapshot_id,
             source=entity.source,
-            retrieved_at=entity.retrieved_at,
+            retrieved_at=entity.retrieved_at.replace(tzinfo=UTC),
             timeframe=entity.timeframe,
             bars_count=entity.bars_count,
             splits_count=entity.splits_count,

@@ -8,6 +8,9 @@ from algo_trading.data.providers.dto import (
     MarketDataSnapshot,
 )
 from algo_trading.data.providers.protocol import MarketDataProvider
+from algo_trading.data.providers.snapshot_checksum import (
+    calculate_snapshot_checksum,
+)
 from algo_trading.domain.corporate_actions.dto import (
     CorporateDividend,
     CorporateSplit,
@@ -74,7 +77,11 @@ class InMemoryMarketDataProvider:
             bars_count=len(bars),
             splits_count=len(splits),
             dividends_count=len(dividends),
-            checksum="in-memory",
+            checksum=calculate_snapshot_checksum(
+                bars=bars,
+                splits=splits,
+                dividends=dividends,
+            ),
         )
         return MarketDataSnapshot(
             metadata=metadata,
