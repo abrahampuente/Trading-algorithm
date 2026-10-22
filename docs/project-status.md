@@ -231,8 +231,8 @@ src/algo_trading/
 ├── persistence/
 │   ├── models/
 │   └── repositories/
-├── indicators/       # Pendiente
-├── strategy/         # Pendiente
+├── indicators/
+├── strategy/
 ├── execution/        # Pendiente
 ├── portfolio/        # Pendiente
 ├── backtesting/      # Pendiente
@@ -385,6 +385,29 @@ Idempotencia (`MarketDataSnapshotPersistenceService.persist`):
 
 `snapshot_id` debe identificar de forma estable la solicitud. `InMemoryMarketDataProvider` usa `source:timeframe:start:end`; el proveedor real debe documentar su convención.
 
+### Indicadores y señales (Hito 1)
+
+Implementado en `Decimal` puro, sin pandas, como funciones sin efectos secundarios:
+
+- `PriceBar` (`Protocol`): lo cumplen `MarketBar` y `MarketBarAdjusted`. Los indicadores se calculan sobre precios ajustados.
+- Las series deben ser de un único símbolo y con timestamps estrictamente crecientes.
+- Contexto `Decimal` explícito: precisión 28, `ROUND_HALF_EVEN`. No se redondea a ticks; la política de redondeo sigue aplazada.
+- `simple_moving_average`: SMA móvil; `None` durante el warm-up.
+- `rolling_population_std` y `bollinger_bands`: desviación estándar poblacional (`ddof=0`), bandas `SMA ± k·σ` con `k = 2` por defecto (configurable).
+- `true_ranges`: `max(H-L, |H-C[t-1]|, |L-C[t-1]|)`; la primera barra no tiene TR.
+- `wilder_atr`: semilla `media(TR[1..20])` en el índice 20 y luego `ATR[t] = (ATR[t-1]·19 + TR[t]) / 20`. El primer ATR está disponible con 21 barras, coherente con el warm-up mínimo.
+- `calculate_indicators` devuelve una tupla de `IndicatorRow` (equivalente a un DataFrame) con `sma`, `upper_band`, `lower_band` y `atr`.
+- `LongSignalGenerator` emite `LongSignal` al cierre de `t` cuando `Close[t] > Close[t-10] > Close[t-20]`, `Close[t-1] <= UpperBand[t-1]` y `Close[t] > UpperBand[t]`. La señal incluye el ATR de `t` (para el filtro anti-gap y el SL/TP) y `momentum = Close[t] / Close[t-20] - 1` para priorizar señales simultáneas.
+
+Garantía de no look-ahead:
+
+- Cada indicador en `t` sólo lee barras `<= t`.
+- `LongSignalGenerator.evaluate` recibe únicamente el historial hasta `t`; no tiene acceso a `t+1`.
+- La señal no contiene precio de entrada: la entrada se simulará en la apertura de `t+1` en el motor de ejecución.
+- Tests: los indicadores y señales calculados sobre cualquier prefijo coinciden con los de la serie completa, y alterar barras posteriores a una señal no la modifica. Ambos tests detectan un sesgo inyectado artificialmente.
+
+Limitación: sin calendario integrado, no se detectan sesiones faltantes; los índices `t-10` y `t-20` cuentan barras disponibles, no sesiones de mercado.
+
 ---
 
 ## 8. Archivos importantes
@@ -437,6 +460,17 @@ src/algo_trading/data/providers/in_memory.py
 ```text
 src/algo_trading/domain/corporate_actions/dto.py
 src/algo_trading/domain/corporate_actions/mapper.py
+```
+
+### Indicadores y estrategia
+
+```text
+src/algo_trading/indicators/price_series.py
+src/algo_trading/indicators/moving_average.py
+src/algo_trading/indicators/bollinger.py
+src/algo_trading/indicators/atr.py
+src/algo_trading/indicators/indicator_frame.py
+src/algo_trading/strategy/long_signal.py
 ```
 
 ### Repositorios
@@ -631,19 +665,20 @@ EquitySnapshot
 
 El contrato de proveedores, los snapshots, la persistencia atómica y la trazabilidad ya están implementados.
 
-Orden inmediato:
-
 Completado:
 
 - Algoritmo reproducible de `checksum` para `DataSnapshot`.
 - Convención de `snapshot_id` y política de idempotencia.
 - DTO de lectura para dividendos en `CorporateActionQueryRepository`.
+- Hito 1: indicadores (SMA, Bollinger, ATR Wilder) y generación de señales Long.
 
 Orden inmediato:
 
 1. Revisar y unificar la semántica temporal de rangos: el proveedor y la ingesta usan límites inclusivos (`start <= x <= end`), mientras que los repositorios de lectura usan rangos semiabiertos (`start <= x < end`).
-2. Diseñar el adaptador del proveedor externo real sin conectarlo todavía a la estrategia.
-3. Decidir proveedor y granularidad intradía antes de implementar su adaptador.
+2. Confirmar el multiplicador de Bollinger (asumido `2`) y la métrica de fuerza del momentum (asumida `Close[t] / Close[t-20] - 1`).
+3. Integrar `pandas-market-calendars` para validar que las series no tengan huecos de sesiones antes de calcular indicadores.
+4. Diseñar el adaptador del proveedor externo real sin conectarlo todavía a la estrategia.
+5. Decidir proveedor y granularidad intradía antes de implementar su adaptador.
 
 No conectar todavía un proveedor externo directamente a la estrategia.
 
@@ -660,9 +695,9 @@ Python: 3.13.3
 Sistema operativo: Windows 11
 IDE: VS Code
 Base de datos: MySQL 8.0 mediante Docker Compose
-Estado: infraestructura, persistencia raw, corporate actions, adjusted data, contrato de proveedores, snapshots, trazabilidad y tests implementados
+Estado: infraestructura, persistencia, snapshots, trazabilidad, indicadores y señales Long implementados
 Validaciones: pytest, ruff y mypy están en verde
-Siguiente tarea: unificar la semántica temporal de rangos (inclusivos vs semiabiertos)
+Siguiente tarea: unificar la semántica temporal de rangos y preparar el motor de gestión monetaria
 Fuente de verdad: docs/project-status.md
 ```
 
