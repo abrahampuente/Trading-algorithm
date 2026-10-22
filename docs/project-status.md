@@ -234,7 +234,7 @@ src/algo_trading/
 ├── indicators/
 ├── strategy/
 ├── execution/        # Pendiente
-├── portfolio/        # Pendiente
+├── portfolio/
 ├── backtesting/      # Pendiente
 └── analytics/        # Pendiente
 ```
@@ -393,11 +393,11 @@ Implementado en `Decimal` puro, sin pandas, como funciones sin efectos secundari
 - Las series deben ser de un único símbolo y con timestamps estrictamente crecientes.
 - Contexto `Decimal` explícito: precisión 28, `ROUND_HALF_EVEN`. No se redondea a ticks; la política de redondeo sigue aplazada.
 - `simple_moving_average`: SMA móvil; `None` durante el warm-up.
-- `rolling_population_std` y `bollinger_bands`: desviación estándar poblacional (`ddof=0`), bandas `SMA ± k·σ` con `k = 2` por defecto (configurable).
+- `rolling_population_std` y `bollinger_bands`: desviación estándar poblacional (`ddof=0`), bandas `SMA ± k·σ` con `k = 2` (confirmado; configurable).
 - `true_ranges`: `max(H-L, |H-C[t-1]|, |L-C[t-1]|)`; la primera barra no tiene TR.
 - `wilder_atr`: semilla `media(TR[1..20])` en el índice 20 y luego `ATR[t] = (ATR[t-1]·19 + TR[t]) / 20`. El primer ATR está disponible con 21 barras, coherente con el warm-up mínimo.
 - `calculate_indicators` devuelve una tupla de `IndicatorRow` (equivalente a un DataFrame) con `sma`, `upper_band`, `lower_band` y `atr`.
-- `LongSignalGenerator` emite `LongSignal` al cierre de `t` cuando `Close[t] > Close[t-10] > Close[t-20]`, `Close[t-1] <= UpperBand[t-1]` y `Close[t] > UpperBand[t]`. La señal incluye el ATR de `t` (para el filtro anti-gap y el SL/TP) y `momentum = Close[t] / Close[t-20] - 1` para priorizar señales simultáneas.
+- `LongSignalGenerator` emite `LongSignal` al cierre de `t` cuando `Close[t] > Close[t-10] > Close[t-20]`, `Close[t-1] <= UpperBand[t-1]` y `Close[t] > UpperBand[t]`. La señal incluye el ATR de `t` (para el filtro anti-gap y el SL/TP) y `momentum = Close[t] / Close[t-20] - 1` (confirmado) para priorizar señales simultáneas.
 
 Garantía de no look-ahead:
 
@@ -407,6 +407,40 @@ Garantía de no look-ahead:
 - Tests: los indicadores y señales calculados sobre cualquier prefijo coinciden con los de la serie completa, y alterar barras posteriores a una señal no la modifica. Ambos tests detectan un sesgo inyectado artificialmente.
 
 Limitación: sin calendario integrado, no se detectan sesiones faltantes; los índices `t-10` y `t-20` cuentan barras disponibles, no sesiones de mercado.
+
+### Gestión monetaria y portfolio (Hito 2)
+
+`PositionSizer` (`RiskParameters`: riesgo 0,5 %, exposición 10 %, 5 posiciones, comisión configurable, por defecto 0):
+
+```text
+cantidad_por_riesgo     = floor(equity * 0.005 / (entrada - SL))
+cantidad_por_capital    = floor(cash / (entrada * (1 + comisión)))
+cantidad_por_exposicion = floor(equity * 0.10 / entrada)
+cantidad_final          = min(las tres)
+```
+
+- Todas las cantidades se redondean hacia abajo a unidades enteras (`ROUND_FLOOR`).
+- Si `cantidad_final < 1`, el resultado no es operable y la entrada se rechaza.
+- `PositionSizingResult` registra las tres cantidades, el factor limitante (`risk`, `capital`, `exposure`; en empate se informa en ese orden), el riesgo planificado, el nocional y la comisión.
+- La comisión se incluye en el límite de capital para que la compra nunca supere el cash.
+- `calculate_long_exit_levels`: `SL = entrada - ATR`, `TP = entrada + 2 * ATR`, con el ATR de la señal congelado.
+
+`PortfolioState`: estado inmutable con `cash` y posiciones; `equity = cash + valor de mercado`, como máximo una posición por símbolo.
+
+`PortfolioAllocator.allocate(candidatos, estado)`:
+
+1. Ordena los `EntryCandidate` por mayor `momentum` y, en empate, por ticker alfabético.
+2. Rechaza `ALREADY_OPEN` si el símbolo ya tiene posición.
+3. Rechaza `MAX_POSITIONS_REACHED` si ya hay 5 posiciones.
+4. Dimensiona la entrada; si la cantidad es < 1, rechaza `BELOW_MINIMUM_QUANTITY` y sigue con el siguiente candidato.
+5. Descuenta el coste total del cash y añade la posición.
+
+Decisiones:
+
+- `EntryCandidate.entry_price` es el precio esperado de ejecución en la apertura de `t+1` (incluido el slippage). Lo aporta el motor de ejecución, que también aplica antes el filtro anti-gap.
+- El equity se fija al inicio de cada lote de señales simultáneas; el cash se reduce tras cada entrada aprobada. Así el tamaño no depende del orden de compra salvo por el cash disponible.
+- Dos candidatos del mismo símbolo en un lote son un error de entrada (`ValueError`).
+- El riesgo teórico simultáneo de 2,5 % no se valida aparte: queda acotado por 5 posiciones × 0,5 % del equity en la entrada.
 
 ---
 
@@ -471,6 +505,15 @@ src/algo_trading/indicators/bollinger.py
 src/algo_trading/indicators/atr.py
 src/algo_trading/indicators/indicator_frame.py
 src/algo_trading/strategy/long_signal.py
+```
+
+### Gestión monetaria
+
+```text
+src/algo_trading/portfolio/position_sizing.py
+src/algo_trading/portfolio/exit_levels.py
+src/algo_trading/portfolio/portfolio_state.py
+src/algo_trading/portfolio/allocator.py
 ```
 
 ### Repositorios
@@ -671,14 +714,14 @@ Completado:
 - Convención de `snapshot_id` y política de idempotencia.
 - DTO de lectura para dividendos en `CorporateActionQueryRepository`.
 - Hito 1: indicadores (SMA, Bollinger, ATR Wilder) y generación de señales Long.
+- Hito 2: position sizing, niveles SL/TP, estado de portfolio y priorización de señales simultáneas.
 
 Orden inmediato:
 
 1. Revisar y unificar la semántica temporal de rangos: el proveedor y la ingesta usan límites inclusivos (`start <= x <= end`), mientras que los repositorios de lectura usan rangos semiabiertos (`start <= x < end`).
-2. Confirmar el multiplicador de Bollinger (asumido `2`) y la métrica de fuerza del momentum (asumida `Close[t] / Close[t-20] - 1`).
-3. Integrar `pandas-market-calendars` para validar que las series no tengan huecos de sesiones antes de calcular indicadores.
-4. Diseñar el adaptador del proveedor externo real sin conectarlo todavía a la estrategia.
-5. Decidir proveedor y granularidad intradía antes de implementar su adaptador.
+2. Integrar `pandas-market-calendars` para validar que las series no tengan huecos de sesiones antes de calcular indicadores.
+3. Diseñar el adaptador del proveedor externo real sin conectarlo todavía a la estrategia.
+4. Decidir proveedor y granularidad intradía antes de implementar su adaptador.
 
 No conectar todavía un proveedor externo directamente a la estrategia.
 
@@ -695,9 +738,9 @@ Python: 3.13.3
 Sistema operativo: Windows 11
 IDE: VS Code
 Base de datos: MySQL 8.0 mediante Docker Compose
-Estado: infraestructura, persistencia, snapshots, trazabilidad, indicadores y señales Long implementados
+Estado: infraestructura, persistencia, snapshots, trazabilidad, indicadores, señales Long y gestión monetaria implementados
 Validaciones: pytest, ruff y mypy están en verde
-Siguiente tarea: unificar la semántica temporal de rangos y preparar el motor de gestión monetaria
+Siguiente tarea: simulador de ejecución y backtesting (Hito 3)
 Fuente de verdad: docs/project-status.md
 ```
 
