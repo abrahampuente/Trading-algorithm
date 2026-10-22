@@ -11,14 +11,16 @@ from algo_trading.analytics.metrics import (
 from algo_trading.backtesting.engine import (
     BacktestParameters,
     BacktestResult,
+    DividendPayment,
     EquityPoint,
     ExecutionBar,
     GapFilteredEntry,
 )
+from algo_trading.domain.corporate_actions.dto import CorporateDividend
 from algo_trading.execution.trade import Trade
 from algo_trading.portfolio.allocator import RejectedCandidate
 
-REPORT_VERSION = "backtest-report-v1"
+REPORT_VERSION = "backtest-report-v2"
 NOT_AVAILABLE = "n/d"
 
 
@@ -37,17 +39,21 @@ class BacktestReport(BaseModel):
     symbols: tuple[str, ...]
     start: str | None
     end: str | None
+    trading_calendar: str | None = None
     parameters: BacktestParameters
     metrics: PerformanceMetrics
     trades: tuple[Trade, ...]
     gap_filtered: tuple[GapFilteredEntry, ...]
     rejected: tuple[RejectedCandidate, ...]
+    dividends: tuple[DividendPayment, ...] = ()
     equity_curve: tuple[EquityPoint, ...]
 
 
 def build_report(
     result: BacktestResult,
     bars_by_symbol: Mapping[str, Sequence[ExecutionBar]],
+    dividends_by_symbol: Mapping[str, Sequence[CorporateDividend]] | None = None,
+    trading_calendar: str | None = None,
 ) -> BacktestReport:
     curve = result.equity_curve
 
@@ -55,11 +61,17 @@ def build_report(
         symbols=tuple(sorted(bars_by_symbol)),
         start=curve[0].timestamp.isoformat() if curve else None,
         end=curve[-1].timestamp.isoformat() if curve else None,
+        trading_calendar=trading_calendar,
         parameters=result.parameters,
-        metrics=calculate_performance_metrics(result, bars_by_symbol),
+        metrics=calculate_performance_metrics(
+            result,
+            bars_by_symbol,
+            dividends_by_symbol,
+        ),
         trades=result.trades,
         gap_filtered=result.gap_filtered,
         rejected=result.rejected,
+        dividends=result.dividends,
         equity_curve=curve,
     )
 
@@ -81,6 +93,7 @@ def report_to_markdown(report: BacktestReport) -> str:
         f"- Versión del informe: `{report.report_version}`",
         f"- Símbolos: {', '.join(report.symbols) or NOT_AVAILABLE}",
         f"- Periodo: {report.start or NOT_AVAILABLE} → {report.end or NOT_AVAILABLE}",
+        f"- Calendario de mercado: {report.trading_calendar or 'sin calendario'}",
         "",
         "## Parámetros",
         "",
@@ -109,6 +122,8 @@ def report_to_markdown(report: BacktestReport) -> str:
         f"{_money(buy_and_hold.final_equity if buy_and_hold else None)} |",
         f"| Retorno acumulado | {_pct(metrics.cumulative_return)} | "
         f"{_pct(buy_and_hold.cumulative_return if buy_and_hold else None)} |",
+        f"| Dividendos cobrados | {_money(metrics.dividend_income)} | "
+        f"{_money(buy_and_hold.dividend_income if buy_and_hold else None)} |",
         f"| Maximum Drawdown | {_pct(drawdown.max_drawdown_pct)} | "
         f"{_pct(buy_and_hold.max_drawdown.max_drawdown_pct if buy_and_hold else None)}"
         " |",

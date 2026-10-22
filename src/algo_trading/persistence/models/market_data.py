@@ -55,4 +55,5 @@ class MarketBarRaw(Base):
             "symbol",
             "timestamp",
         ),
+        Index("ix_market_bars_raw_snapshot_id", "snapshot_id"),
     )

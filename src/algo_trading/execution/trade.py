@@ -24,6 +24,7 @@ class OpenTrade(BaseModel):
     entry_commission: Decimal = Field(ge=0)
     exit_levels: ExitLevels
     planned_risk: Decimal
+    dividend_income: Decimal = Field(default=Decimal("0"), ge=0)
 
     @property
     def entry_cost(self) -> Decimal:
@@ -38,8 +39,10 @@ class Trade(BaseModel):
     - `gross_pnl = (salida_teórica - entrada_teórica) * cantidad`
     - `slippage_cost`: diferencia entre precios teóricos y ejecutados.
     - `total_costs = comisiones + slippage_cost`
-    - `net_pnl = gross_pnl - total_costs`
+    - `dividend_income`: dividendos cobrados en cash mientras estuvo abierta.
+    - `net_pnl = gross_pnl - total_costs + dividend_income`
       `= (salida_ejecutada - entrada_ejecutada) * cantidad - comisiones`
+      `+ dividendos`
     - `return_pct = net_pnl / coste de entrada (incluida comisión)`
     """
 
@@ -63,6 +66,7 @@ class Trade(BaseModel):
     exit_commission: Decimal
     slippage_cost: Decimal
     total_costs: Decimal
+    dividend_income: Decimal = Decimal("0")
     gross_pnl: Decimal
     net_pnl: Decimal
     return_pct: Decimal
@@ -94,7 +98,7 @@ def close_trade(
             open_trade.entry_executed_price - open_trade.entry_theoretical_price
         ) * quantity + (decision.theoretical_price - exit_executed_price) * quantity
         total_costs = open_trade.entry_commission + exit_commission + slippage_cost
-        net_pnl = gross_pnl - total_costs
+        net_pnl = gross_pnl - total_costs + open_trade.dividend_income
         return_pct = net_pnl / open_trade.entry_cost
 
     return Trade(
@@ -116,6 +120,7 @@ def close_trade(
         exit_commission=exit_commission,
         slippage_cost=slippage_cost,
         total_costs=total_costs,
+        dividend_income=open_trade.dividend_income,
         gross_pnl=gross_pnl,
         net_pnl=net_pnl,
         return_pct=return_pct,

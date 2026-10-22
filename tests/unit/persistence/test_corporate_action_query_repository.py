@@ -83,7 +83,7 @@ def test_get_splits_by_symbol_returns_ordered_results() -> None:
     engine.dispose()
 
 
-def test_get_splits_filters_by_half_open_date_range_and_source() -> None:
+def test_get_splits_filters_by_inclusive_date_range_and_source() -> None:
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
 
@@ -92,7 +92,9 @@ def test_get_splits_filters_by_half_open_date_range_and_source() -> None:
             [
                 build_split(date(2024, 1, 1), source="provider-a"),
                 build_split(date(2024, 2, 1), source="provider-a"),
-                build_split(date(2024, 3, 1), source="provider-b"),
+                build_split(date(2024, 2, 15), source="provider-b"),
+                build_split(date(2024, 3, 1), source="provider-a"),
+                build_split(date(2024, 3, 2), source="provider-a"),
             ]
         )
         session.commit()
@@ -106,10 +108,10 @@ def test_get_splits_filters_by_half_open_date_range_and_source() -> None:
             source="provider-a",
         )
 
-        assert len(splits) == 2
         assert [split.ex_date for split in splits] == [
             date(2024, 1, 1),
             date(2024, 2, 1),
+            date(2024, 3, 1),
         ]
 
     engine.dispose()
@@ -193,7 +195,7 @@ def test_get_dividend_dtos_by_symbol_returns_ordered_dividends_only() -> None:
     engine.dispose()
 
 
-def test_get_dividend_dtos_filters_by_half_open_date_range_and_source() -> None:
+def test_get_dividend_dtos_filters_by_inclusive_date_range_and_source() -> None:
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
 
@@ -205,6 +207,7 @@ def test_get_dividend_dtos_filters_by_half_open_date_range_and_source() -> None:
                 build_dividend(date(2024, 2, 1), source="provider-b"),
                 build_dividend(date(2024, 2, 15), source="provider-a"),
                 build_dividend(date(2024, 3, 1), source="provider-a"),
+                build_dividend(date(2024, 3, 2), source="provider-a"),
             ]
         )
         session.commit()
@@ -221,6 +224,7 @@ def test_get_dividend_dtos_filters_by_half_open_date_range_and_source() -> None:
         assert [dividend.ex_date for dividend in dividends] == [
             date(2024, 1, 1),
             date(2024, 2, 15),
+            date(2024, 3, 1),
         ]
         assert all(dividend.source == "provider-a" for dividend in dividends)
 

@@ -94,3 +94,24 @@ def test_losing_trade_includes_costs_in_net_pnl() -> None:
     assert trade.gross_pnl == Decimal("-19.5")
     assert trade.net_pnl < trade.gross_pnl
     assert trade.net_pnl == trade.gross_pnl - trade.total_costs
+
+
+def test_dividend_income_is_added_to_net_pnl_but_not_to_gross() -> None:
+    open_trade = build_open_trade().model_copy(
+        update={"dividend_income": Decimal("2.5")}
+    )
+
+    trade = close_trade(
+        open_trade,
+        ExitDecision(
+            reason=ExitReason.TAKE_PROFIT,
+            theoretical_price=Decimal("104"),
+        ),
+        exit_timestamp=datetime(2024, 1, 5, tzinfo=UTC),
+        exit_session_index=8,
+        costs=COSTS,
+    )
+
+    assert trade.dividend_income == Decimal("2.5")
+    assert trade.gross_pnl == Decimal("40")
+    assert trade.net_pnl == Decimal("37.96001") + Decimal("2.5")

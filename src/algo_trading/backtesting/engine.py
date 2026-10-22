@@ -1,10 +1,15 @@
 from collections.abc import Mapping, Sequence
-from datetime import datetime
-from decimal import Decimal
+from datetime import date, datetime
+from decimal import Decimal, localcontext
 from typing import Protocol, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from algo_trading.data.market_calendar import (
+    SessionCoverageError,
+    check_session_coverage,
+)
+from algo_trading.domain.corporate_actions.dto import CorporateDividend
 from algo_trading.execution.costs import CostModel
 from algo_trading.execution.exit_rules import (
     ExitDecision,
@@ -21,7 +26,12 @@ from algo_trading.portfolio.allocator import (
     RejectedCandidate,
 )
 from algo_trading.portfolio.portfolio_state import PortfolioState, Position
-from algo_trading.portfolio.position_sizing import PositionSizer, RiskParameters
+from algo_trading.portfolio.position_sizing import (
+    MONEY_PRECISION,
+    MONEY_ROUNDING,
+    PositionSizer,
+    RiskParameters,
+)
 from algo_trading.strategy.long_signal import (
     LongSignal,
     LongSignalGenerator,
@@ -81,6 +91,19 @@ class EquityPoint(BaseModel):
     open_positions: int = Field(ge=0)
 
 
+class DividendPayment(BaseModel):
+    """Dividendo acreditado en cash a una posición abierta."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    symbol: str
+    ex_date: date
+    payment_timestamp: datetime
+    amount_per_share: Decimal
+    quantity: int = Field(ge=1)
+    total: Decimal
+
+
 class BacktestResult(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -90,6 +113,8 @@ class BacktestResult(BaseModel):
     rejected: tuple[RejectedCandidate, ...]
     equity_curve: tuple[EquityPoint, ...]
     final_cash: Decimal
+    dividends: tuple[DividendPayment, ...] = ()
+    uses_trading_calendar: bool = False
 
 
 class BacktestEngine:
@@ -98,6 +123,9 @@ class BacktestEngine:
 
     En cada sesión `D`, en este orden:
 
+    0. Dividendos: las posiciones abiertas antes de `D` cobran en cash los
+       dividendos con fecha ex-dividendo posterior a la sesión anterior y
+       hasta `D` (normalmente, ex_date = `D`).
     1. Apertura: salidas temporales de posiciones con `max_holding_sessions`
        sesiones cumplidas.
     2. Apertura: entradas de las señales emitidas al cierre de la sesión
@@ -109,7 +137,16 @@ class BacktestEngine:
 
     Las señales se precalculan con `LongSignalGenerator`, que es invariante a
     barras futuras; la señal de la barra `k` sólo se usa en la barra `k+1`.
-    Las sesiones se cuentan con las barras de cada símbolo (sin calendario).
+
+    Con `trading_sessions` (fechas del calendario de mercado), cada serie
+    debe cubrir todas las sesiones entre su primera y última barra y no tener
+    barras en días sin sesión: así el índice de barra de los indicadores
+    (`t-10`, `t-20`, ventanas de 20) equivale a sesiones de mercado, y la
+    salida temporal cuenta sesiones del calendario. Sin calendario, se
+    cuentan las barras de cada símbolo.
+
+    Los dividendos deben expresarse en la misma escala que las barras (para
+    barras ajustadas por splits, dividendos ajustados por splits).
     """
 
     def __init__(self, parameters: BacktestParameters) -> None:
@@ -120,10 +157,21 @@ class BacktestEngine:
     def run(
         self,
         bars_by_symbol: Mapping[str, Sequence[ExecutionBar]],
+        trading_sessions: Sequence[date] | None = None,
+        dividends_by_symbol: Mapping[str, Sequence[CorporateDividend]] | None = None,
     ) -> BacktestResult:
         parameters = self._parameters
         costs = parameters.costs
         series = self._validate_series(bars_by_symbol)
+        calendar_index = self._validate_calendar(series, trading_sessions)
+        dividends = self._validate_dividends(series, dividends_by_symbol or {})
+
+        def session_number(symbol: str, index: int) -> int:
+            if calendar_index is None:
+                return index
+
+            return calendar_index[series[symbol][index].timestamp.date()]
+
         index_by_symbol = {
             symbol: {bar.timestamp: index for index, bar in enumerate(bars)}
             for symbol, bars in series.items()
@@ -144,6 +192,8 @@ class BacktestEngine:
         gap_filtered: list[GapFilteredEntry] = []
         rejected: list[RejectedCandidate] = []
         equity_curve: list[EquityPoint] = []
+        dividend_payments: list[DividendPayment] = []
+        previous_session_date: date | None = None
 
         for session in sessions:
             todays_index = {
@@ -151,6 +201,43 @@ class BacktestEngine:
                 for symbol, indexes in index_by_symbol.items()
                 if session in indexes
             }
+            session_date = session.date()
+
+            # 0. Dividendos de posiciones abiertas antes de esta sesión.
+            for symbol in sorted(open_trades):
+                open_trade = open_trades[symbol]
+                entry_date = open_trade.entry_timestamp.date()
+
+                for dividend in dividends.get(symbol, ()):
+                    is_new = (
+                        previous_session_date is None
+                        or dividend.ex_date > previous_session_date
+                    )
+
+                    if not (is_new and entry_date < dividend.ex_date <= session_date):
+                        continue
+
+                    with localcontext(prec=MONEY_PRECISION, rounding=MONEY_ROUNDING):
+                        total = dividend.amount * open_trade.quantity
+
+                    cash += total
+                    open_trade = open_trade.model_copy(
+                        update={"dividend_income": open_trade.dividend_income + total}
+                    )
+                    dividend_payments.append(
+                        DividendPayment(
+                            symbol=symbol,
+                            ex_date=dividend.ex_date,
+                            payment_timestamp=session,
+                            amount_per_share=dividend.amount,
+                            quantity=open_trade.quantity,
+                            total=total,
+                        )
+                    )
+
+                open_trades[symbol] = open_trade
+
+            previous_session_date = session_date
 
             # 1. Salidas temporales a la apertura.
             for symbol in sorted(open_trades):
@@ -161,7 +248,7 @@ class BacktestEngine:
                 open_trade = open_trades[symbol]
 
                 if (
-                    index - open_trade.entry_session_index
+                    session_number(symbol, index) - open_trade.entry_session_index
                     < parameters.max_holding_sessions
                 ):
                     continue
@@ -170,7 +257,13 @@ class BacktestEngine:
                     series[symbol][index].open,
                     open_trade.exit_levels,
                 )
-                trade = close_trade(open_trade, decision, session, index, costs)
+                trade = close_trade(
+                    open_trade,
+                    decision,
+                    session,
+                    session_number(symbol, index),
+                    costs,
+                )
                 cash += trade.exit_proceeds
                 trades.append(trade)
                 del open_trades[symbol]
@@ -237,7 +330,7 @@ class BacktestEngine:
                         symbol=symbol,
                         signal_timestamp=planned.candidate.signal.signal_timestamp,
                         entry_timestamp=session,
-                        entry_session_index=index,
+                        entry_session_index=session_number(symbol, index),
                         quantity=planned.sizing.quantity,
                         entry_theoretical_price=series[symbol][index].open,
                         entry_executed_price=planned.candidate.entry_price,
@@ -264,7 +357,13 @@ class BacktestEngine:
                 if exit_decision is None:
                     continue
 
-                trade = close_trade(open_trade, exit_decision, session, index, costs)
+                trade = close_trade(
+                    open_trade,
+                    exit_decision,
+                    session,
+                    session_number(symbol, index),
+                    costs,
+                )
                 cash += trade.exit_proceeds
                 trades.append(trade)
                 del open_trades[symbol]
@@ -301,7 +400,7 @@ class BacktestEngine:
                     theoretical_price=last_bar.close,
                 ),
                 last_bar.timestamp,
-                last_index,
+                session_number(symbol, last_index),
                 costs,
             )
             cash += trade.exit_proceeds
@@ -314,7 +413,55 @@ class BacktestEngine:
             rejected=tuple(rejected),
             equity_curve=tuple(equity_curve),
             final_cash=cash,
+            dividends=tuple(dividend_payments),
+            uses_trading_calendar=calendar_index is not None,
         )
+
+    @staticmethod
+    def _validate_calendar(
+        series: Mapping[str, Sequence[ExecutionBar]],
+        trading_sessions: Sequence[date] | None,
+    ) -> dict[date, int] | None:
+        if trading_sessions is None:
+            return None
+
+        ordered_sessions = sorted(set(trading_sessions))
+        coverages = [
+            check_session_coverage(
+                symbol,
+                [bar.timestamp.date() for bar in bars],
+                ordered_sessions,
+            )
+            for symbol, bars in series.items()
+        ]
+        incomplete = [coverage for coverage in coverages if not coverage.is_complete]
+
+        if incomplete:
+            raise SessionCoverageError(incomplete)
+
+        return {session: index for index, session in enumerate(ordered_sessions)}
+
+    @staticmethod
+    def _validate_dividends(
+        series: Mapping[str, Sequence[ExecutionBar]],
+        dividends_by_symbol: Mapping[str, Sequence[CorporateDividend]],
+    ) -> dict[str, tuple[CorporateDividend, ...]]:
+        dividends: dict[str, tuple[CorporateDividend, ...]] = {}
+
+        for symbol, symbol_dividends in dividends_by_symbol.items():
+            if symbol not in series:
+                continue
+
+            if any(dividend.symbol != symbol for dividend in symbol_dividends):
+                raise ValueError(
+                    f"Todos los dividendos de {symbol} deben tener ese símbolo"
+                )
+
+            dividends[symbol] = tuple(
+                sorted(symbol_dividends, key=lambda dividend: dividend.ex_date)
+            )
+
+        return dividends
 
     @staticmethod
     def _validate_series(

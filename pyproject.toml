@@ -16,6 +16,7 @@ dependencies = [
     "Alembic>=1.13",
     "PyMySQL>=1.1",
     "yfinance>=1.7",
+    "pandas-market-calendars>=5.5",
 ]
 
 [project.optional-dependencies]
@@ -58,6 +59,7 @@ mypy_path = "src"
 strict = true
 
 [[tool.mypy.overrides]]
-# yfinance no publica tipos; su uso queda aislado en fetch_yahoo_history.
-module = ["yfinance", "yfinance.*"]
+# yfinance y pandas-market-calendars no publican tipos; su uso queda aislado
+# en fetch_yahoo_history y ExchangeCalendar.
+module = ["yfinance", "yfinance.*", "pandas_market_calendars", "pandas_market_calendars.*"]
 ignore_missing_imports = true

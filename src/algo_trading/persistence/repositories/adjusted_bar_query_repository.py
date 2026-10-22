@@ -25,7 +25,7 @@ class AdjustedMarketBarQueryRepository:
         adjustment_version: str | None = None,
     ) -> Sequence[MarketBarAdjusted]:
         """
-        Obtiene barras ajustadas en el intervalo semiabierto [start, end).
+        Obtiene barras ajustadas en el intervalo inclusivo [start, end].
 
         Las barras se ordenan cronológicamente.
         """
@@ -34,7 +34,7 @@ class AdjustedMarketBarQueryRepository:
             .where(
                 MarketBarAdjusted.symbol == symbol,
                 MarketBarAdjusted.timestamp >= start,
-                MarketBarAdjusted.timestamp < end,
+                MarketBarAdjusted.timestamp <= end,
                 MarketBarAdjusted.timeframe == timeframe,
             )
             .order_by(MarketBarAdjusted.timestamp)

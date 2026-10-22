@@ -73,4 +73,5 @@ class CorporateAction(Base):
             "symbol",
             "ex_date",
         ),
+        Index("ix_corporate_actions_snapshot_id", "snapshot_id"),
     )

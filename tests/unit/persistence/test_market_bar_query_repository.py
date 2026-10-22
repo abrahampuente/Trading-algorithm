@@ -22,7 +22,7 @@ def build_bar(timestamp: datetime, symbol: str = "AAPL") -> MarketBarRaw:
     )
 
 
-def test_get_by_symbol_returns_ordered_bars_in_half_open_interval() -> None:
+def test_get_by_symbol_returns_ordered_bars_in_inclusive_interval() -> None:
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
 
@@ -31,6 +31,7 @@ def test_get_by_symbol_returns_ordered_bars_in_half_open_interval() -> None:
             [
                 build_bar(datetime(2024, 1, 3)),
                 build_bar(datetime(2024, 1, 1)),
+                build_bar(datetime(2024, 1, 4)),
                 build_bar(datetime(2024, 1, 2)),
             ]
         )
@@ -44,9 +45,11 @@ def test_get_by_symbol_returns_ordered_bars_in_half_open_interval() -> None:
             end=datetime(2024, 1, 3),
         )
 
+        # Intervalo inclusivo: incluye end (01-03) y excluye 01-04.
         assert [bar.timestamp for bar in bars] == [
             datetime(2024, 1, 1),
             datetime(2024, 1, 2),
+            datetime(2024, 1, 3),
         ]
 
     engine.dispose()

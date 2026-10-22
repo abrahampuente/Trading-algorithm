@@ -87,7 +87,7 @@ def test_json_export_preserves_decimals_and_round_trips() -> None:
     exported = report_to_json(report)
     payload = json.loads(exported)
 
-    assert payload["report_version"] == "backtest-report-v1"
+    assert payload["report_version"] == "backtest-report-v2"
     assert payload["symbols"] == ["AAA"]
     assert payload["parameters"]["initial_cash"] == "100000"
     assert payload["parameters"]["costs"]["commission_rate"] == "0.0005"

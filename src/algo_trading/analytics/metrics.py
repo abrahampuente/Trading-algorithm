@@ -1,11 +1,12 @@
 from collections import Counter
 from collections.abc import Mapping, Sequence
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal, localcontext
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from algo_trading.backtesting.engine import BacktestResult, ExecutionBar
+from algo_trading.domain.corporate_actions.dto import CorporateDividend
 from algo_trading.execution.costs import CostModel
 from algo_trading.execution.trade import Trade
 from algo_trading.portfolio.position_sizing import MONEY_PRECISION, MONEY_ROUNDING
@@ -66,6 +67,8 @@ class BuyAndHoldComparison(BaseModel):
     El capital inicial se reparte a partes iguales; cada símbolo se compra en
     la apertura de su primera barra y se vende al último cierre, con los
     mismos costes por ejecución que la estrategia (unidades fraccionarias).
+    Los dividendos con ex_date posterior a la compra y hasta la última barra
+    se acreditan en cash (no se reinvierten).
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -73,6 +76,7 @@ class BuyAndHoldComparison(BaseModel):
     initial_equity: Decimal
     final_equity: Decimal
     cumulative_return: Decimal
+    dividend_income: Decimal = Decimal("0")
     max_drawdown: Drawdown
     strategy_excess_return: Decimal
 
@@ -84,6 +88,7 @@ class PerformanceMetrics(BaseModel):
     final_equity: Decimal
     net_profit: Decimal
     cumulative_return: Decimal
+    dividend_income: Decimal = Decimal("0")
     trades: TradeStatistics
     max_drawdown: Drawdown
     exposure: Exposure
@@ -199,11 +204,16 @@ def calculate_buy_and_hold(
     initial_equity: Decimal,
     costs: CostModel,
     strategy_return: Decimal,
+    dividends_by_symbol: Mapping[str, Sequence[CorporateDividend]] | None = None,
 ) -> BuyAndHoldComparison | None:
     series = {symbol: bars for symbol, bars in bars_by_symbol.items() if bars}
 
     if not series:
         return None
+
+    dividends = dividends_by_symbol or {}
+    first_dates = {symbol: bars[0].timestamp.date() for symbol, bars in series.items()}
+    last_dates = {symbol: bars[-1].timestamp.date() for symbol, bars in series.items()}
 
     with localcontext(prec=MONEY_PRECISION, rounding=MONEY_ROUNDING):
         allocation = initial_equity / len(series)
@@ -220,10 +230,27 @@ def calculate_buy_and_hold(
 
         last_close: dict[str, Decimal] = {}
         equity_points: list[tuple[datetime, Decimal]] = []
+        dividend_cash = ZERO
+        previous_date: date | None = None
 
         for session in sorted(closes_by_session):
+            session_date = session.date()
             last_close.update(closes_by_session[session])
-            equity = sum(
+
+            for symbol in series:
+                for dividend in dividends.get(symbol, ()):
+                    is_new = previous_date is None or dividend.ex_date > previous_date
+
+                    if (
+                        is_new
+                        and dividend.ex_date <= session_date
+                        and first_dates[symbol] < dividend.ex_date
+                        and dividend.ex_date <= last_dates[symbol]
+                    ):
+                        dividend_cash += units[symbol] * dividend.amount
+
+            previous_date = session_date
+            equity = dividend_cash + sum(
                 (
                     units[symbol] * last_close[symbol]
                     if symbol in last_close
@@ -234,7 +261,7 @@ def calculate_buy_and_hold(
             )
             equity_points.append((session, equity))
 
-        final_equity = sum(
+        final_equity = dividend_cash + sum(
             (
                 units[symbol]
                 * costs.sell_price(bars[-1].close)
@@ -249,6 +276,7 @@ def calculate_buy_and_hold(
             initial_equity=initial_equity,
             final_equity=final_equity,
             cumulative_return=cumulative_return,
+            dividend_income=dividend_cash,
             max_drawdown=calculate_max_drawdown(equity_points, initial_equity),
             strategy_excess_return=strategy_return - cumulative_return,
         )
@@ -257,6 +285,7 @@ def calculate_buy_and_hold(
 def calculate_performance_metrics(
     result: BacktestResult,
     bars_by_symbol: Mapping[str, Sequence[ExecutionBar]] | None = None,
+    dividends_by_symbol: Mapping[str, Sequence[CorporateDividend]] | None = None,
 ) -> PerformanceMetrics:
     """
     Calcula las métricas de un backtest.
@@ -277,6 +306,7 @@ def calculate_performance_metrics(
             initial_equity=initial_equity,
             costs=result.parameters.costs,
             strategy_return=cumulative_return,
+            dividends_by_symbol=dividends_by_symbol,
         )
         if bars_by_symbol is not None
         else None
@@ -287,6 +317,7 @@ def calculate_performance_metrics(
         final_equity=final_equity,
         net_profit=final_equity - initial_equity,
         cumulative_return=cumulative_return,
+        dividend_income=sum((payment.total for payment in result.dividends), ZERO),
         trades=calculate_trade_statistics(result.trades),
         max_drawdown=calculate_max_drawdown(
             [(point.timestamp, point.equity) for point in result.equity_curve],

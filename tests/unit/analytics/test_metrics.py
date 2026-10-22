@@ -9,6 +9,7 @@ from algo_trading.analytics import (
 )
 from algo_trading.backtesting import BacktestParameters, BacktestResult, EquityPoint
 from algo_trading.data.market_bar import MarketBar
+from algo_trading.domain.corporate_actions.dto import CorporateDividend
 from algo_trading.execution import (
     CostModel,
     ExitDecision,
@@ -335,3 +336,42 @@ def test_buy_and_hold_without_bars_is_none() -> None:
         )
         is None
     )
+
+
+def test_buy_and_hold_credits_dividends_after_purchase() -> None:
+    bars = {
+        "AAA": [
+            build_bar("AAA", 0, "100", "100"),
+            build_bar("AAA", 1, "100", "100"),
+            build_bar("AAA", 2, "100", "100"),
+        ]
+    }
+    dividends = {
+        "AAA": [
+            # Ex-date el día de compra: no se cobra.
+            CorporateDividend(
+                symbol="AAA", ex_date=day(0), amount=Decimal("5"), source="t"
+            ),
+            CorporateDividend(
+                symbol="AAA", ex_date=day(1), amount=Decimal("2"), source="t"
+            ),
+            # Ex-date posterior a la última barra: no se cobra.
+            CorporateDividend(
+                symbol="AAA", ex_date=day(5), amount=Decimal("5"), source="t"
+            ),
+        ]
+    }
+
+    comparison = calculate_buy_and_hold(
+        bars,
+        initial_equity=Decimal("1000"),
+        costs=ZERO_COSTS,
+        strategy_return=Decimal("0"),
+        dividends_by_symbol=dividends,
+    )
+
+    assert comparison is not None
+    # 10 unidades x 2 = 20 en cash.
+    assert comparison.dividend_income == Decimal("20")
+    assert comparison.final_equity == Decimal("1020")
+    assert comparison.cumulative_return == Decimal("0.02")

@@ -406,7 +406,7 @@ Garantía de no look-ahead:
 - La señal no contiene precio de entrada: la entrada se simulará en la apertura de `t+1` en el motor de ejecución.
 - Tests: los indicadores y señales calculados sobre cualquier prefijo coinciden con los de la serie completa, y alterar barras posteriores a una señal no la modifica. Ambos tests detectan un sesgo inyectado artificialmente.
 
-Limitación: sin calendario integrado, no se detectan sesiones faltantes; los índices `t-10` y `t-20` cuentan barras disponibles, no sesiones de mercado.
+Conteo de sesiones: los indicadores cuentan barras. Con calendario de mercado (ver «Calendario de mercado»), el backtest exige que cada serie cubra todas sus sesiones, de modo que `t-10`, `t-20` y las ventanas de 20 equivalen exactamente a sesiones de mercado.
 
 ### Gestión monetaria y portfolio (Hito 2)
 
@@ -490,7 +490,7 @@ Las señales se precalculan por símbolo con `LongSignalGenerator`, cuya invaria
 Limitaciones actuales:
 
 - Opera sobre barras diarias: la granularidad intradía queda pendiente del proveedor. Con barras diarias, la regla de prioridad del SL se aplica siempre que la vela toque ambos niveles.
-- Las sesiones se cuentan con las barras de cada símbolo, sin calendario de mercado.
+- Sin calendario, las sesiones se cuentan con las barras de cada símbolo; con calendario, la salida temporal cuenta sesiones del calendario.
 - Una salida por SL/TP durante la barra no libera plaza para entradas de esa misma apertura.
 
 ### Ingesta de datos reales: Yahoo Finance
@@ -543,7 +543,7 @@ Verificado: AAPL 2020-08-28 raw 499.23 → ajustado 124.81 (factor 0.25); GOOGL 
 
 `BacktestRunService` (`backtesting/run_service.py`) lee `market_bars_adjusted` (sólo lectura) por símbolo, `source` y `adjustment_version`, convierte las filas a `MarketBar` con timestamp UTC, ejecuta `BacktestEngine` y devuelve el `BacktestReport`.
 
-- Periodo con fechas de sesión inclusivas (internamente `[start, end + 1 día)` sobre el repositorio semiabierto).
+- Periodo con fechas de sesión inclusivas: `[start 00:00, end 23:59:59]` sobre el repositorio inclusivo.
 - Si algún símbolo no tiene barras en el periodo, falla con `MissingMarketDataError` indicando cuáles.
 
 CLI `algo-backtest` (`cli/backtest.py`):
@@ -568,7 +568,69 @@ Salidas: STOP_LOSS 91, TAKE_PROFIT 61, TIME_EXIT 6 · GAP_FILTERED 18 · rechazo
 Tiempo en mercado 31.52 % · exposición media 4.86 % · costes 3,165.49
 ```
 
-Lectura: la estrategia tiene expectativa positiva pero baja exposición (operaciones de ~5 sesiones con un 10 % máximo por posición), por lo que el capital pasa la mayor parte del tiempo en cash. Los costes consumen cerca del 38 % del beneficio bruto. Buy & Hold no incluye dividendos (la estrategia tampoco los acredita aún).
+Lectura: la estrategia tiene expectativa positiva pero baja exposición (operaciones de ~5 sesiones con un 10 % máximo por posición), por lo que el capital pasa la mayor parte del tiempo en cash. Los costes consumen cerca del 38 % del beneficio bruto. Esta primera ejecución no incluía dividendos ni calendario (ver resultados actualizados abajo).
+
+### Semántica temporal de rangos
+
+Todos los rangos de lectura son **inclusivos**: `start <= x <= end`, igual que el proveedor y la ingesta.
+
+- `RawMarketBarQueryRepository.get_by_symbol` y `AdjustedMarketBarQueryRepository.get_by_symbol`: `start <= timestamp <= end`.
+- `CorporateActionQueryRepository` (splits y dividendos): `start <= ex_date <= end`.
+- Para incluir una fecha de sesión completa con timestamps, `end` = esa fecha a las 23:59:59 (convención de `algo-ingest` y `BacktestRunService`).
+
+### Calendario de mercado
+
+`ExchangeCalendar` (`data/market_calendar.py`) usa `pandas-market-calendars` (por defecto `NYSE`; `NASDAQ` comparte festivos):
+
+- `sessions(start, end)` devuelve `TradingSession` con apertura y cierre en UTC e `is_early_close`. Los festivos y cierres excepcionales (p. ej. 2025-01-09) no son sesiones; los cierres tempranos (p. ej. 2024-11-29, 18:00 UTC) se marcan.
+- `check_session_coverage` compara las barras de un símbolo con las sesiones entre su primera y última barra: sesiones ausentes y barras en días sin sesión.
+- `BacktestEngine.run(..., trading_sessions=...)`: si alguna serie no está completa lanza `SessionCoverageError` (con símbolos y fechas) y no se ejecuta ni se persiste nada. Con series completas, índice de barra = sesión de mercado (indicadores) y la salida temporal cuenta sesiones del calendario.
+- Los cierres tempranos no afectan a la simulación diaria; quedan disponibles para la futura simulación intradía.
+- Verificado con datos reales: NYSE tiene 1710 sesiones entre 2020-01-01 y 2026-10-21, exactamente las barras de cada símbolo ingerido.
+- Es la única clase que toca `pandas-market-calendars` (sin tipos; override de mypy).
+
+### Dividendos en cash
+
+- `market_bars_raw` y `corporate_actions` guardan dividendos raw. Para operar con barras ajustadas por splits, `BacktestRunService` los lleva a la misma escala: `dividendo_ajustado = dividendo_raw * factor`, con el factor acumulado de los splits posteriores al ex_date.
+- Estrategia (`BacktestEngine`, paso 0 de cada sesión): una posición abierta antes de la fecha ex-dividendo cobra `importe * cantidad` en cash en la primera sesión con fecha >= ex_date (normalmente la propia ex_date). Una entrada en la misma ex_date no cobra; una salida en la apertura de la ex_date sí cobra (se poseía al cierre anterior).
+- Cada pago queda en `BacktestResult.dividends` (`DividendPayment`) y se suma a `Trade.dividend_income`; `net_pnl = gross_pnl - total_costs + dividend_income`. El PnL bruto no incluye dividendos.
+- Buy & Hold: dividendos con ex_date posterior a la compra y hasta la última barra se acreditan en cash (no se reinvierten).
+- `--no-dividends` en `algo-backtest` los desactiva para ambos.
+
+### Persistencia de backtests
+
+Migración `9c4d5e6f7a8b` (`alembic upgrade head`):
+
+```text
+backtest_runs              run_id (UUID), created_at, report_version, report_checksum,
+                           símbolos, periodo, source, adjustment_version, trading_calendar,
+                           parameters (JSON), métricas principales y Buy & Hold
+backtest_trades            un registro por trade (precios, costes, dividendos, PnL, motivo)
+backtest_equity_snapshots  curva de equity diaria, UNIQUE(run_id, timestamp)
+```
+
+- `BacktestRunService.run(request, persist=True)` guarda la ejecución, sus trades y su curva en una transacción y devuelve `BacktestRunOutcome(run_id, report, report_checksum)`. `report_checksum` es el SHA-256 del JSON del informe: dos ejecuciones con datos y parámetros idénticos tienen el mismo checksum.
+- `BacktestRunRepository`: `add`, `get_summary`, `list_summaries` (más recientes primero), `get_trades`, `get_equity_curve`.
+- Importes redondeados a 8 decimales y ratios a 10 al persistir (escala de las columnas).
+- `algo-backtest --list-runs N` compara ejecuciones guardadas; `--no-persist` no escribe en MySQL.
+
+Ejemplo de comparación SQL:
+
+```sql
+SELECT run_id, created_at, JSON_EXTRACT(parameters, '$.gap_threshold_atr') AS gap,
+       cumulative_return, max_drawdown_pct, total_trades, profit_factor, buy_and_hold_return
+FROM backtest_runs ORDER BY created_at DESC;
+```
+
+Resultados con calendario NYSE y dividendos (2026-10-22), 2020-01-02 → 2026-10-21:
+
+```text
+run (gap)     Retorno   MDD     Trades  PF    Dividendos  B&H       MDD B&H  Dividendos B&H
+0.5 × ATR     5.27 %    3.41 %  158     1.28  151.02      282.93 %  32.47 %  8,906.61
+1.0 × ATR     5.10 %    3.68 %  171     1.25  151.02      282.93 %  32.47 %  8,906.61
+```
+
+El calendario no cambió los trades (las series ya cubrían todas las sesiones). Relajar el anti-gap a 1.0 añade 13 operaciones y empeora ligeramente retorno, MDD y Profit Factor.
 
 ### Métricas e informes (Hito 4)
 
@@ -644,6 +706,10 @@ src/algo_trading/data/providers/yfinance.py
 src/algo_trading/cli/ingest.py
 src/algo_trading/backtesting/run_service.py
 src/algo_trading/cli/backtest.py
+src/algo_trading/data/market_calendar.py
+src/algo_trading/persistence/models/backtest.py
+src/algo_trading/persistence/repositories/backtest_run_repository.py
+migrations/versions/9c4d5e6f7a8b_create_backtest_results.py
 ```
 
 ### Dominio
@@ -805,10 +871,11 @@ Esto debe documentarse y mantenerse consistente en todo el sistema.
 
 ### 11.2 Corporate actions
 
+Implementado: acreditación de dividendos en cash en la fecha ex-dividendo (estrategia y Buy & Hold).
+
 Falta implementar:
 
 - Validación cruzada entre tipo de acción y campo requerido.
-- Servicio completo para acreditar dividendos a cash.
 - Versionado formal de snapshots de acciones corporativas.
 
 ### 11.3 Proveedor de datos
@@ -839,20 +906,9 @@ Pendiente decidir:
 
 ### 11.5 Calendario
 
-Debe integrarse:
+Integrado `pandas-market-calendars` (ver «Calendario de mercado»): bolsa NYSE por defecto, horarios en UTC, festivos, cierres excepcionales y tempranos, y conteo exacto de sesiones para indicadores y salida temporal.
 
-```text
-pandas-market-calendars
-```
-
-Hay que definir:
-
-- Bolsa objetivo.
-- Zona horaria.
-- Sesiones regulares.
-- Festivos.
-- Cierres tempranos.
-- Conteo exacto del time exit.
+Pendiente: uso de horarios y cierres tempranos en la simulación intradía.
 
 ### 11.6 Precisión
 
@@ -865,16 +921,13 @@ Debe definirse la frontera exacta entre Pandas/NumPy y el dominio financiero.
 
 ### 11.7 Modelos pendientes
 
-Faltan entidades y DTOs para:
+Implementados como DTOs: `LongSignal`, `Position`, `Trade`, `EquityPoint`, `DividendPayment`. Persistidos: `BacktestRun`, `Trade` y `EquitySnapshot` (`backtest_runs`, `backtest_trades`, `backtest_equity_snapshots`).
+
+Pendientes (necesarios para simulación intradía o ejecución real):
 
 ```text
-Signal
 Order
 Fill
-Position
-Trade
-BacktestRun
-EquitySnapshot
 ```
 
 ---
@@ -894,16 +947,16 @@ Completado:
 - Hito 4: métricas de performance, comparación Buy & Hold y exportación del informe en JSON/Markdown.
 - Ingesta real: `YFinanceProvider`, CLI `algo-ingest` y carga inicial de AAPL, MSFT, GOOGL, SPY y QQQ (2020 → 2026-10-21).
 - Backtest sobre MySQL: `BacktestRunService` y CLI `algo-backtest` con informe JSON/Markdown.
+- Rangos de lectura inclusivos en todos los repositorios.
+- Calendario de mercado NYSE con validación de sesiones y conteo exacto de la salida temporal.
+- Dividendos acreditados en cash (estrategia y Buy & Hold).
+- Persistencia y comparación de ejecuciones (`backtest_runs`, `backtest_trades`, `backtest_equity_snapshots`).
 
 Orden inmediato:
 
-1. Revisar y unificar la semántica temporal de rangos: el proveedor y la ingesta usan límites inclusivos (`start <= x <= end`), mientras que los repositorios de lectura usan rangos semiabiertos (`start <= x < end`).
-2. Integrar `pandas-market-calendars` para validar que las series no tengan huecos de sesiones antes de calcular indicadores y contar sesiones.
-3. Acreditar dividendos en cash (estrategia y Buy & Hold) en la fecha ex-dividendo.
-4. Perfiles de costes optimista y conservador, y análisis de sensibilidad del umbral anti-gap.
-5. Persistir `BacktestRun`, `Trade` y `EquitySnapshot` en MySQL si se necesita comparar ejecuciones desde la base de datos.
-6. Reintentos con backoff para el proveedor real y validación de calidad de datos (huecos, saltos de precio).
-7. Decidir proveedor y granularidad intradía antes de implementar su adaptador y la simulación intradía.
+1. Perfiles de costes optimista y conservador, y análisis de sensibilidad del umbral anti-gap (barrido de parámetros persistido en `backtest_runs`).
+2. Reintentos con backoff para el proveedor real y validación de calidad de datos (saltos de precio, volumen cero).
+3. Decidir proveedor y granularidad intradía antes de implementar su adaptador y la simulación intradía (usando horarios y cierres tempranos del calendario).
 
 No conectar todavía un proveedor externo directamente a la estrategia.
 
@@ -920,9 +973,9 @@ Python: 3.13.3
 Sistema operativo: Windows 11
 IDE: VS Code
 Base de datos: MySQL 8.0 mediante Docker Compose
-Estado: v1 completa en datos diarios: persistencia, snapshots, indicadores, señales Long, gestión monetaria, backtesting, métricas e informes
+Estado: v1 completa en datos diarios: ingesta real, calendario NYSE, dividendos, indicadores, señales Long, gestión monetaria, backtesting persistido, métricas e informes
 Validaciones: pytest, ruff y mypy están en verde
-Siguiente tarea: unificar la semántica de rangos e integrar el calendario de mercado
+Siguiente tarea: perfiles de costes y análisis de sensibilidad del umbral anti-gap
 Fuente de verdad: docs/project-status.md
 ```
 
@@ -936,8 +989,8 @@ ruff format --check .
 mypy src
 ```
 
-No regenerar módulos ya implementados. Continuar desde la semántica temporal de rangos y el adaptador del proveedor externo.
+No regenerar módulos ya implementados. Continuar desde los perfiles de costes y el análisis de sensibilidad del umbral anti-gap.
 
 Al abrir el siguiente chat, bastará con indicar:
 
-> Este proyecto continúa desde `docs/project-status.md`. Lee ese estado y no regeneres módulos ya implementados. El siguiente paso es unificar la semántica temporal de rangos entre proveedor, ingesta y repositorios de lectura.
+> Este proyecto continúa desde `docs/project-status.md`. Lee ese estado y no regeneres módulos ya implementados. El siguiente paso son los perfiles de costes optimista y conservador y el análisis de sensibilidad del umbral anti-gap.

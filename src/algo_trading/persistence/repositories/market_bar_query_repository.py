@@ -21,13 +21,17 @@ class RawMarketBarQueryRepository:
         timeframe: str = "1d",
         source: str | None = None,
     ) -> Sequence[MarketBarRaw]:
-        """Obtiene barras ordenadas cronológicamente para un símbolo."""
+        """
+        Obtiene barras en el intervalo inclusivo [start, end].
+
+        Las barras se ordenan cronológicamente.
+        """
         statement = (
             select(MarketBarRaw)
             .where(
                 MarketBarRaw.symbol == symbol,
                 MarketBarRaw.timestamp >= start,
-                MarketBarRaw.timestamp < end,
+                MarketBarRaw.timestamp <= end,
                 MarketBarRaw.timeframe == timeframe,
             )
             .order_by(MarketBarRaw.timestamp)

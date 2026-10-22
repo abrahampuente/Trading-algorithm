@@ -45,7 +45,7 @@ class CorporateActionQueryRepository:
         end: date | None = None,
         source: str | None = None,
     ) -> Sequence[CorporateAction]:
-        """Obtiene splits ordenados por fecha ex-date."""
+        """Obtiene splits con ex_date en [start, end], ordenados por ex_date."""
         statement = (
             select(CorporateAction)
             .where(
@@ -59,7 +59,7 @@ class CorporateActionQueryRepository:
             statement = statement.where(CorporateAction.ex_date >= start)
 
         if end is not None:
-            statement = statement.where(CorporateAction.ex_date < end)
+            statement = statement.where(CorporateAction.ex_date <= end)
 
         if source is not None:
             statement = statement.where(CorporateAction.source == source)
@@ -102,7 +102,7 @@ class CorporateActionQueryRepository:
         end: date | None = None,
         source: str | None = None,
     ) -> Sequence[CorporateAction]:
-        """Obtiene dividendos ordenados por fecha ex-date."""
+        """Obtiene dividendos con ex_date en [start, end], ordenados por ex_date."""
         statement = (
             select(CorporateAction)
             .where(
@@ -116,7 +116,7 @@ class CorporateActionQueryRepository:
             statement = statement.where(CorporateAction.ex_date >= start)
 
         if end is not None:
-            statement = statement.where(CorporateAction.ex_date < end)
+            statement = statement.where(CorporateAction.ex_date <= end)
 
         if source is not None:
             statement = statement.where(CorporateAction.source == source)
