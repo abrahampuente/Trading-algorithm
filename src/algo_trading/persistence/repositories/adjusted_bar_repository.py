@@ -1,5 +1,6 @@
 from collections.abc import Sequence
 
+from sqlalchemy import delete
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -30,6 +31,28 @@ class AdjustedMarketBarRepository:
         """Añade varias barras ajustadas sin confirmar la transacción."""
         self._session.add_all(bars)
         return list(bars)
+
+    def delete_for_symbol(
+        self,
+        symbol: str,
+        source: str,
+        timeframe: str,
+        adjustment_version: str,
+    ) -> int:
+        """
+        Elimina las barras ajustadas de un símbolo y versión de ajuste.
+
+        Son datos derivados de las barras raw y se regeneran a partir de
+        ellas. No confirma la transacción.
+        """
+        statement = delete(MarketBarAdjusted).where(
+            MarketBarAdjusted.symbol == symbol,
+            MarketBarAdjusted.source == source,
+            MarketBarAdjusted.timeframe == timeframe,
+            MarketBarAdjusted.adjustment_version == adjustment_version,
+        )
+        result = self._session.execute(statement)
+        return int(getattr(result, "rowcount", 0))
 
     def flush(self) -> None:
         """Envía los cambios pendientes sin confirmar la transacción."""

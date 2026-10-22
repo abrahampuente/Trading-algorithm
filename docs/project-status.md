@@ -493,6 +493,52 @@ Limitaciones actuales:
 - Las sesiones se cuentan con las barras de cada símbolo, sin calendario de mercado.
 - Una salida por SL/TP durante la barra no libera plaza para entradas de esa misma apertura.
 
+### Ingesta de datos reales: Yahoo Finance
+
+`YFinanceProvider` (`data/providers/yfinance.py`) implementa `MarketDataProvider` con `yfinance` para datos diarios (`source = "yfinance"`, `timeframe = "1d"`).
+
+Yahoo entrega OHLCV y dividendos **ya ajustados por splits** (también con `auto_adjust=False`). Para que `market_bars_raw` sea realmente raw y `AdjustedMarketDataService` no ajuste dos veces, el adaptador deshace los splits:
+
+```text
+factor        = factor acumulado de splits posteriores a la barra (SplitAdjustmentCalculator)
+precio_raw    = precio_yahoo / factor
+volumen_raw   = volumen_yahoo * factor
+dividendo_raw = dividendo_yahoo / factor
+```
+
+- Se usan todos los splits conocidos hasta hoy, no sólo los de la ventana: Yahoo ajusta el histórico por splits futuros a la ventana.
+- `timestamp` diario = fecha de sesión de la bolsa a las 00:00 UTC.
+- Valores redondeados a 8 decimales (escala de MySQL). Yahoo publica precios con precisión de coma flotante, por lo que los raw reconstruidos arrastran ruido del orden de 1e-7 relativo (p. ej. `499.23001099`). Es irrelevante para el backtest; la política de redondeo a tick sigue aplazada.
+- Filas con valores ausentes se omiten; filas con OHLC inconsistente se descartan y se informan (`rejected_rows`).
+- `snapshot_id = yfinance:1d:<símbolos>:<inicio>:<fin>`.
+- `fetch_yahoo_history` es la única función que toca `yfinance`/`pandas` (sin tipos; override de mypy sólo para `yfinance`). El resto recibe DTOs tipados, y los tests usan un fetcher falso sin red.
+- Timeout de 30 s por llamada a Yahoo. En la primera carga una descarga quedó bloqueada ~10 min antes de completarse; desde entonces las acciones corporativas se piden con `history(period="max")`, que sí acepta timeout.
+
+CLI `algo-ingest` (`cli/ingest.py`, también `python -m algo_trading.cli.ingest`):
+
+```powershell
+algo-ingest                                   # AAPL MSFT GOOGL SPY QQQ desde 2020-01-01 hasta ayer
+algo-ingest --symbols AAPL --start 2021-01-04 --end 2021-12-31
+```
+
+Por símbolo:
+
+1. Reanuda desde el día siguiente a la última barra raw (o `--start`). El fin por defecto es ayer en UTC para no guardar la sesión en curso incompleta.
+2. Si hay barras nuevas, guarda un snapshot con `MarketDataSnapshotIngestionService` (raw, splits y dividendos). Sin barras nuevas no crea snapshot.
+3. Regenera las barras ajustadas del símbolo con `AdjustedMarketDataService.rebuild_for_symbol`: borra y reinserta la versión de ajuste (`splits-v1`) en una transacción, porque un split nuevo cambia todo el histórico ajustado.
+4. Un fallo en un símbolo no detiene al resto; código de salida 1 si alguno falla.
+
+Carga inicial (2026-10-22), 2020-01-02 → 2026-10-21:
+
+```text
+market_bars_raw       8550  (1710 por símbolo, todas con snapshot_id)
+market_bars_adjusted  8550
+corporate_actions      120  (2 splits: AAPL 4:1 2020-08-31, GOOGL 20:1 2022-07-18; 118 dividendos)
+data_snapshots           5
+```
+
+Verificado: AAPL 2020-08-28 raw 499.23 → ajustado 124.81 (factor 0.25); GOOGL 2022-07-15 raw 2235.55 → ajustado 111.78 (factor 0.05). Los ajustados coinciden con los precios de Yahoo. Una segunda ejecución es idempotente.
+
 ### Métricas e informes (Hito 4)
 
 `calculate_performance_metrics(result, bars_by_symbol)` (`analytics/metrics.py`):
@@ -563,6 +609,8 @@ src/algo_trading/data/market_data_snapshot_ingestion_service.py
 src/algo_trading/data/providers/dto.py
 src/algo_trading/data/providers/protocol.py
 src/algo_trading/data/providers/in_memory.py
+src/algo_trading/data/providers/yfinance.py
+src/algo_trading/cli/ingest.py
 ```
 
 ### Dominio
@@ -739,11 +787,12 @@ Implementado:
 - Proveedor `InMemoryMarketDataProvider` para pruebas.
 - Ingesta, validación, persistencia atómica y trazabilidad de snapshots.
 - Checksum reproducible e idempotencia por `snapshot_id` (ver sección 7).
+- `YFinanceProvider` (Yahoo Finance, diario) y CLI `algo-ingest` (ver sección 7).
 
 Pendiente:
 
-- Implementar un proveedor externo real detrás del contrato.
-- Decidir la política de reintentos, rate limits y errores transitorios del proveedor real.
+- Reintentos con backoff y control de rate limits: hoy hay timeout de 30 s por llamada, sin reintentos; el fallo queda aislado por símbolo y una nueva ejecución reanuda.
+- Proveedor intradía.
 
 ### 11.4 Datos intradía
 
@@ -810,13 +859,14 @@ Completado:
 - Hito 2: position sizing, niveles SL/TP, estado de portfolio y priorización de señales simultáneas.
 - Hito 3: costes, escudo anti-gap, reglas de salida con prioridad del SL, salida temporal, registro de trades y motor de backtesting diario.
 - Hito 4: métricas de performance, comparación Buy & Hold y exportación del informe en JSON/Markdown.
+- Ingesta real: `YFinanceProvider`, CLI `algo-ingest` y carga inicial de AAPL, MSFT, GOOGL, SPY y QQQ (2020 → 2026-10-21).
 
 Orden inmediato:
 
 1. Revisar y unificar la semántica temporal de rangos: el proveedor y la ingesta usan límites inclusivos (`start <= x <= end`), mientras que los repositorios de lectura usan rangos semiabiertos (`start <= x < end`).
 2. Integrar `pandas-market-calendars` para validar que las series no tengan huecos de sesiones antes de calcular indicadores y contar sesiones.
 3. Servicio que cargue barras ajustadas desde MySQL, ejecute el backtest y guarde el informe (y, si se requiere, persistir `BacktestRun`, `Trade` y `EquitySnapshot`).
-4. Diseñar el adaptador del proveedor externo real sin conectarlo todavía a la estrategia.
+4. Reintentos con backoff para el proveedor real y validación de calidad de datos (huecos, saltos de precio).
 5. Decidir proveedor y granularidad intradía antes de implementar su adaptador y la simulación intradía.
 6. Perfiles de costes optimista y conservador, y análisis de sensibilidad del umbral anti-gap.
 

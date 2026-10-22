@@ -15,6 +15,7 @@ dependencies = [
     "SQLAlchemy>=2.0",
     "Alembic>=1.13",
     "PyMySQL>=1.1",
+    "yfinance>=1.7",
 ]
 
 [project.optional-dependencies]
@@ -25,6 +26,9 @@ dev = [
     "types-PyYAML>=6.0",
 ]
 
+
+[project.scripts]
+algo-ingest = "algo_trading.cli.ingest:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -51,3 +55,8 @@ indent-style = "space"
 python_version = "3.13"
 mypy_path = "src"
 strict = true
+
+[[tool.mypy.overrides]]
+# yfinance no publica tipos; su uso queda aislado en fetch_yahoo_history.
+module = ["yfinance", "yfinance.*"]
+ignore_missing_imports = true

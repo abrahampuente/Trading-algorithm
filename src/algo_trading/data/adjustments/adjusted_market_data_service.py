@@ -24,8 +24,54 @@ class AdjustedMarketDataService:
         adjustment_version: str,
     ) -> None:
         self._session = session
+        self._adjustment_version = adjustment_version
         self._builder = AdjustedMarketBarBuilder(adjustment_version)
         self._repository = AdjustedMarketBarRepository(session)
+
+    def rebuild_for_symbol(
+        self,
+        symbol: str,
+        source: str,
+        timeframe: str,
+        raw_bars: Sequence[MarketBarRaw],
+        splits: Iterable[CorporateSplit],
+    ) -> int:
+        """
+        Regenera todas las barras ajustadas de un símbolo en una transacción.
+
+        Un split nuevo cambia el ajuste de todo el historial anterior, por lo
+        que se reemplazan las barras de esta versión de ajuste en lugar de
+        añadir sólo las nuevas.
+        """
+        if any(
+            bar.symbol != symbol or bar.source != source or bar.timeframe != timeframe
+            for bar in raw_bars
+        ):
+            raise ValueError(
+                "Las barras raw deben pertenecer al símbolo, source y timeframe "
+                "indicados"
+            )
+
+        split_events = tuple(splits)
+        adjusted_bars = [
+            self._builder.build(raw_bar, split_events) for raw_bar in raw_bars
+        ]
+
+        try:
+            self._repository.delete_for_symbol(
+                symbol=symbol,
+                source=source,
+                timeframe=timeframe,
+                adjustment_version=self._adjustment_version,
+            )
+            entities = self._repository.add_many(adjusted_bars)
+            self._repository.flush()
+            self._session.commit()
+        except Exception:
+            self._session.rollback()
+            raise
+
+        return len(entities)
 
     def build_and_persist(
         self,
