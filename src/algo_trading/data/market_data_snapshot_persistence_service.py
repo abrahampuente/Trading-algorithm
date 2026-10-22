@@ -1,6 +1,9 @@
 from sqlalchemy.orm import Session
 
 from algo_trading.data.providers.dto import DataSnapshot, MarketDataSnapshot
+from algo_trading.data.providers.snapshot_checksum import (
+    calculate_snapshot_checksum,
+)
 from algo_trading.data.validation.market_bar_validator import validate_market_bars
 from algo_trading.domain.corporate_actions.dto import (
     CorporateDividend,
@@ -25,12 +28,18 @@ class SnapshotContentConflictError(ValueError):
     """
 
 
+class SnapshotChecksumMismatchError(ValueError):
+    """Indica que el checksum declarado no corresponde al contenido."""
+
+
 class MarketDataSnapshotPersistenceService:
     """
     Persiste un MarketDataSnapshot en una única transacción.
 
-    Un reintento con el mismo snapshot_id y checksum es idempotente:
-    no genera inserciones duplicadas y devuelve el snapshot existente.
+    El checksum declarado se recalcula sobre el contenido antes de cualquier
+    escritura. Un reintento con el mismo snapshot_id y checksum es
+    idempotente: no genera inserciones duplicadas y devuelve el snapshot
+    existente.
     """
 
     def __init__(self, session: Session) -> None:
@@ -41,6 +50,8 @@ class MarketDataSnapshotPersistenceService:
 
     def persist(self, snapshot: MarketDataSnapshot) -> DataSnapshot:
         """Valida y persiste atómicamente el snapshot completo."""
+        self._validate_checksum(snapshot)
+
         existing_snapshot = self._snapshot_repository.get_by_snapshot_id(
             snapshot.metadata.snapshot_id
         )
@@ -79,6 +90,19 @@ class MarketDataSnapshotPersistenceService:
             raise
 
         return snapshot.metadata
+
+    @staticmethod
+    def _validate_checksum(snapshot: MarketDataSnapshot) -> None:
+        expected_checksum = calculate_snapshot_checksum(
+            bars=snapshot.bars,
+            splits=snapshot.splits,
+            dividends=snapshot.dividends,
+        )
+
+        if snapshot.metadata.checksum != expected_checksum:
+            raise SnapshotChecksumMismatchError(
+                "El checksum del snapshot no coincide con su contenido"
+            )
 
     @staticmethod
     def _validate_existing_snapshot(

@@ -8,9 +8,14 @@ from sqlalchemy.orm import Session
 from algo_trading.data.market_bar import MarketBar
 from algo_trading.data.market_data_snapshot_persistence_service import (
     MarketDataSnapshotPersistenceService,
+    SnapshotChecksumMismatchError,
     SnapshotContentConflictError,
 )
 from algo_trading.data.providers.dto import DataSnapshot, MarketDataSnapshot
+from algo_trading.data.providers.snapshot_checksum import (
+    calculate_snapshot_checksum,
+)
+from algo_trading.domain.corporate_actions import CorporateActionMapper
 from algo_trading.domain.corporate_actions.dto import (
     CorporateDividend,
     CorporateSplit,
@@ -34,47 +39,55 @@ SOURCE = "snapshot-integration-test"
 SNAPSHOT_ID = "snapshot-integration-test:1d:2024-01-01:2024-01-31"
 
 
-def build_snapshot() -> MarketDataSnapshot:
+def build_snapshot(close: Decimal = Decimal("103")) -> MarketDataSnapshot:
+    bars = (
+        MarketBar(
+            symbol="AAPL",
+            timestamp=datetime(2024, 1, 2, 14, 30, tzinfo=UTC),
+            timeframe="1d",
+            source=SOURCE,
+            open=Decimal("100"),
+            high=Decimal("105"),
+            low=Decimal("99"),
+            close=close,
+            volume=Decimal("1000000"),
+        ),
+    )
+    splits = (
+        CorporateSplit(
+            symbol="AAPL",
+            ex_date=date(2024, 1, 15),
+            ratio=Decimal("2"),
+            source=SOURCE,
+        ),
+    )
+    dividends = (
+        CorporateDividend(
+            symbol="AAPL",
+            ex_date=date(2024, 1, 20),
+            amount=Decimal("0.25"),
+            source=SOURCE,
+        ),
+    )
+
     return MarketDataSnapshot(
         metadata=DataSnapshot(
             snapshot_id=SNAPSHOT_ID,
             source=SOURCE,
             retrieved_at=datetime(2024, 1, 31, 22, 0, tzinfo=UTC),
             timeframe="1d",
-            bars_count=1,
-            splits_count=1,
-            dividends_count=1,
-            checksum="snapshot-integration-checksum",
-        ),
-        bars=(
-            MarketBar(
-                symbol="AAPL",
-                timestamp=datetime(2024, 1, 2, 14, 30, tzinfo=UTC),
-                timeframe="1d",
-                source=SOURCE,
-                open=Decimal("100"),
-                high=Decimal("105"),
-                low=Decimal("99"),
-                close=Decimal("103"),
-                volume=Decimal("1000000"),
+            bars_count=len(bars),
+            splits_count=len(splits),
+            dividends_count=len(dividends),
+            checksum=calculate_snapshot_checksum(
+                bars=bars,
+                splits=splits,
+                dividends=dividends,
             ),
         ),
-        splits=(
-            CorporateSplit(
-                symbol="AAPL",
-                ex_date=date(2024, 1, 15),
-                ratio=Decimal("2"),
-                source=SOURCE,
-            ),
-        ),
-        dividends=(
-            CorporateDividend(
-                symbol="AAPL",
-                ex_date=date(2024, 1, 20),
-                amount=Decimal("0.25"),
-                source=SOURCE,
-            ),
-        ),
+        bars=bars,
+        splits=splits,
+        dividends=dividends,
     )
 
 
@@ -180,12 +193,7 @@ def test_rejects_existing_snapshot_id_with_different_checksum() -> None:
         original_snapshot = build_snapshot()
         service.persist(original_snapshot)
 
-        conflicting_metadata = original_snapshot.metadata.model_copy(
-            update={"checksum": "different-checksum"}
-        )
-        conflicting_snapshot = original_snapshot.model_copy(
-            update={"metadata": conflicting_metadata}
-        )
+        conflicting_snapshot = build_snapshot(close=Decimal("104"))
 
         with pytest.raises(
             SnapshotContentConflictError,
@@ -202,6 +210,98 @@ def test_rejects_existing_snapshot_id_with_different_checksum() -> None:
 
         assert len(persisted_bars) == 1
         assert len(persisted_actions) == 2
+
+        clean_test_data(session)
+
+    engine.dispose()
+
+
+def test_rejects_snapshot_whose_checksum_does_not_match_content() -> None:
+    engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+
+    with Session(engine) as session:
+        clean_test_data(session)
+
+        snapshot = build_snapshot()
+        tampered_metadata = snapshot.metadata.model_copy(
+            update={"checksum": "declared-by-provider"}
+        )
+        tampered_snapshot = snapshot.model_copy(update={"metadata": tampered_metadata})
+
+        service = MarketDataSnapshotPersistenceService(session)
+
+        with pytest.raises(
+            SnapshotChecksumMismatchError,
+            match="no coincide con su contenido",
+        ):
+            service.persist(tampered_snapshot)
+
+        persisted_snapshot = session.scalar(
+            select(DataSnapshotModel).where(
+                DataSnapshotModel.snapshot_id == SNAPSHOT_ID
+            )
+        )
+        persisted_bars = session.scalars(
+            select(MarketBarRaw).where(MarketBarRaw.source == SOURCE)
+        ).all()
+
+        assert persisted_snapshot is None
+        assert len(persisted_bars) == 0
+
+        clean_test_data(session)
+
+    engine.dispose()
+
+
+def test_checksum_is_reproducible_from_persisted_data() -> None:
+    engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+
+    with Session(engine) as session:
+        clean_test_data(session)
+
+        snapshot = build_snapshot()
+        MarketDataSnapshotPersistenceService(session).persist(snapshot)
+
+        persisted_bars = RawMarketBarQueryRepository(session).get_by_snapshot_id(
+            SNAPSHOT_ID
+        )
+        persisted_actions = CorporateActionQueryRepository(session).get_by_snapshot_id(
+            SNAPSHOT_ID
+        )
+
+        bars = tuple(
+            MarketBar(
+                symbol=bar.symbol,
+                timestamp=bar.timestamp,
+                timeframe=bar.timeframe,
+                source=bar.source,
+                open=bar.open,
+                high=bar.high,
+                low=bar.low,
+                close=bar.close,
+                volume=bar.volume,
+            )
+            for bar in persisted_bars
+        )
+        domain_actions = [
+            CorporateActionMapper.to_domain(action) for action in persisted_actions
+        ]
+        splits = tuple(
+            action for action in domain_actions if isinstance(action, CorporateSplit)
+        )
+        dividends = tuple(
+            action for action in domain_actions if isinstance(action, CorporateDividend)
+        )
+
+        assert all(bar.timestamp.tzinfo is None for bar in bars)
+        assert (
+            calculate_snapshot_checksum(
+                bars=bars,
+                splits=splits,
+                dividends=dividends,
+            )
+            == snapshot.metadata.checksum
+        )
 
         clean_test_data(session)
 

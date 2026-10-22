@@ -353,7 +353,37 @@ Implementado:
 - `MarketDataSnapshotIngestionService` que obtiene, valida y persiste snapshots desde un proveedor.
 - Trazabilidad mediante `snapshot_id` opcional en `market_bars_raw` y `corporate_actions`.
 - Consultas de barras raw y acciones corporativas por `snapshot_id`.
+- Checksum reproducible de snapshots (`calculate_snapshot_checksum`, versión `market-data-snapshot-v1`).
+- Verificación del checksum declarado y política de idempotencia por `snapshot_id`.
+- Lectura de dividendos como DTO `CorporateDividend` (`get_dividend_dtos_by_symbol`).
 - Pruebas unitarias e integraciones contra MySQL para proveedor, snapshots, persistencia, rollback y trazabilidad.
+
+### Convención de checksum e idempotencia de snapshots
+
+Algoritmo (`src/algo_trading/data/providers/snapshot_checksum.py`):
+
+```text
+checksum = sha256(json_canónico(payload)).hexdigest()
+```
+
+- `payload = {version, bars, splits, dividends}`.
+- Barras ordenadas por `(symbol, timestamp, timeframe, source)`; splits y dividendos por `(symbol, ex_date, source)`. El orden de entrega del proveedor no afecta al resultado.
+- JSON con `sort_keys=True`, separadores `(",", ":")` y `ensure_ascii=True`.
+- `Decimal` normalizado (`Decimal("103.0")` y `Decimal("103.00000000")` producen el mismo hash).
+- Timestamps serializados en UTC con microsegundos y offset `+00:00`. Los timestamps naive se interpretan como UTC, de modo que el checksum recalculado desde MySQL coincide con el original.
+- Fechas `ex_date` en ISO `YYYY-MM-DD`.
+- Los metadatos (`snapshot_id`, `retrieved_at`, conteos) no forman parte del hash: el checksum identifica contenido, no la descarga.
+- Cualquier cambio en la serialización exige una nueva versión de `CHECKSUM_VERSION`. Un test fija el hash de referencia de v1.
+
+Idempotencia (`MarketDataSnapshotPersistenceService.persist`):
+
+1. Se recalcula el checksum sobre el contenido. Si no coincide con `metadata.checksum`, se lanza `SnapshotChecksumMismatchError` y no se escribe nada.
+2. Si el `snapshot_id` no existe, se persisten snapshot, barras y acciones corporativas en una única transacción.
+3. Si el `snapshot_id` existe con el mismo checksum, `source` y `timeframe`, la operación es un no-op y devuelve los metadatos existentes.
+4. Si el `snapshot_id` existe con otro checksum, `source` o `timeframe`, se lanza `SnapshotContentConflictError`.
+5. Si el mismo contenido llega con otro `snapshot_id`, las restricciones UNIQUE de raw y corporate actions lo rechazan (`DuplicateMarketBarError` / `DuplicateCorporateActionError`).
+
+`snapshot_id` debe identificar de forma estable la solicitud. `InMemoryMarketDataProvider` usa `source:timeframe:start:end`; el proveedor real debe documentar su convención.
 
 ---
 
@@ -526,7 +556,6 @@ Esto debe documentarse y mantenerse consistente en todo el sistema.
 
 Falta implementar:
 
-- Repositorio de lectura de dividendos como DTO.
 - Validación cruzada entre tipo de acción y campo requerido.
 - Servicio completo para acreditar dividendos a cash.
 - Versionado formal de snapshots de acciones corporativas.
@@ -539,11 +568,11 @@ Implementado:
 - DTOs de solicitudes y snapshots.
 - Proveedor `InMemoryMarketDataProvider` para pruebas.
 - Ingesta, validación, persistencia atómica y trazabilidad de snapshots.
+- Checksum reproducible e idempotencia por `snapshot_id` (ver sección 7).
 
 Pendiente:
 
 - Implementar un proveedor externo real detrás del contrato.
-- Definir el algoritmo de `checksum` reproducible para snapshots.
 - Decidir la política de reintentos, rate limits y errores transitorios del proveedor real.
 
 ### 11.4 Datos intradía
@@ -604,12 +633,17 @@ El contrato de proveedores, los snapshots, la persistencia atómica y la trazabi
 
 Orden inmediato:
 
-1. Revisar y confirmar la semántica temporal de rangos: actualmente las barras se filtran con límites inclusivos (`start <= timestamp <= end`) y las corporate actions también.
-2. Definir un algoritmo reproducible de `checksum` para `DataSnapshot`.
-3. Documentar la convención de `snapshot_id` y su política de idempotencia.
-4. Añadir DTO de lectura para dividendos en `CorporateActionQueryRepository`.
-5. Diseñar el adaptador del proveedor externo real sin conectarlo todavía a la estrategia.
-6. Decidir proveedor y granularidad intradía antes de implementar su adaptador.
+Completado:
+
+- Algoritmo reproducible de `checksum` para `DataSnapshot`.
+- Convención de `snapshot_id` y política de idempotencia.
+- DTO de lectura para dividendos en `CorporateActionQueryRepository`.
+
+Orden inmediato:
+
+1. Revisar y unificar la semántica temporal de rangos: el proveedor y la ingesta usan límites inclusivos (`start <= x <= end`), mientras que los repositorios de lectura usan rangos semiabiertos (`start <= x < end`).
+2. Diseñar el adaptador del proveedor externo real sin conectarlo todavía a la estrategia.
+3. Decidir proveedor y granularidad intradía antes de implementar su adaptador.
 
 No conectar todavía un proveedor externo directamente a la estrategia.
 
@@ -628,7 +662,7 @@ IDE: VS Code
 Base de datos: MySQL 8.0 mediante Docker Compose
 Estado: infraestructura, persistencia raw, corporate actions, adjusted data, contrato de proveedores, snapshots, trazabilidad y tests implementados
 Validaciones: pytest, ruff y mypy están en verde
-Siguiente tarea: definir checksum e idempotencia de `DataSnapshot`, y completar DTOs de lectura de dividendos
+Siguiente tarea: unificar la semántica temporal de rangos (inclusivos vs semiabiertos)
 Fuente de verdad: docs/project-status.md
 ```
 
@@ -642,8 +676,8 @@ ruff format --check .
 mypy src
 ```
 
-No regenerar módulos ya implementados. Continuar desde snapshots, trazabilidad y el contrato de proveedores de datos.
+No regenerar módulos ya implementados. Continuar desde la semántica temporal de rangos y el adaptador del proveedor externo.
 
 Al abrir el siguiente chat, bastará con indicar:
 
-> Este proyecto continúa desde `docs/project-status.md`. Lee ese estado y no regeneres módulos ya implementados. El siguiente paso es definir el `checksum` e idempotencia de `DataSnapshot`, y completar los DTOs de lectura de dividendos.
+> Este proyecto continúa desde `docs/project-status.md`. Lee ese estado y no regeneres módulos ya implementados. El siguiente paso es unificar la semántica temporal de rangos entre proveedor, ingesta y repositorios de lectura.

@@ -93,9 +93,15 @@ def _dividend_to_payload(dividend: CorporateDividend) -> dict[str, str]:
 
 
 def _serialize_datetime(value: datetime) -> str:
-    """Normaliza timestamps aware a UTC y los serializa de forma estable."""
+    """
+    Normaliza timestamps a UTC y los serializa de forma estable.
+
+    Los timestamps naive se interpretan como UTC, que es la convención de
+    persistencia en MySQL. Así, un snapshot recalculado desde la base de
+    datos produce el mismo checksum que el snapshot original con timezone.
+    """
     if value.tzinfo is None:
-        return value.isoformat(timespec="microseconds")
+        value = value.replace(tzinfo=UTC)
 
     return value.astimezone(UTC).isoformat(timespec="microseconds")
 

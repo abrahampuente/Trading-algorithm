@@ -1,7 +1,5 @@
 from collections.abc import Sequence
-from unittest.mock import MagicMock
 
-import pytest
 from sqlalchemy.orm import Session
 
 from algo_trading.data.market_bar import MarketBar
@@ -9,11 +7,6 @@ from algo_trading.data.validation.market_bar_validator import validate_market_ba
 from algo_trading.persistence.repositories.market_bar_repository import (
     RawMarketBarRepository,
 )
-
-
-@pytest.fixture
-def session() -> MagicMock:
-    return MagicMock(spec=Session)
 
 
 class IngestionService:
