@@ -233,9 +233,9 @@ src/algo_trading/
 │   └── repositories/
 ├── indicators/
 ├── strategy/
-├── execution/        # Pendiente
+├── execution/
 ├── portfolio/
-├── backtesting/      # Pendiente
+├── backtesting/
 └── analytics/        # Pendiente
 ```
 
@@ -442,6 +442,57 @@ Decisiones:
 - Dos candidatos del mismo símbolo en un lote son un error de entrada (`ValueError`).
 - El riesgo teórico simultáneo de 2,5 % no se valida aparte: queda acotado por 5 posiciones × 0,5 % del equity en la entrada.
 
+### Ejecución simulada y backtesting (Hito 3)
+
+Costes (`CostModel`, perfil base): comisión 0,05 % y slippage 0,05 % por ejecución.
+
+```text
+compra: ejecutado = teórico * (1 + slippage)
+venta:  ejecutado = teórico * (1 - slippage)
+comisión = ejecutado * cantidad * commission_rate
+```
+
+Escudo anti-gap (`is_gap_filtered`):
+
+- Cancela la entrada si `Open[t+1] - Close[t] > umbral * ATR[t]`; umbral por defecto `0.5`, configurable.
+- Usa la apertura teórica (sin slippage) y el ATR del cierre de `t`.
+- Un gap exactamente igual al umbral se permite. Los gaps bajistas nunca se filtran.
+- Se registra como `GapFilteredEntry` (`GAP_FILTERED`) con el gap y el máximo permitido. No ocupa plaza ni participa en la priorización.
+
+Reglas de salida Long (`evaluate_bar_exit`), con `SL = entrada_ejecutada - ATR` y `TP = entrada_ejecutada + 2 * ATR`:
+
+1. Si `Low <= SL`, sale por `STOP_LOSS` aunque la barra también alcance el TP: el SL tiene prioridad absoluta.
+2. El SL se ejecuta en `min(Open, SL)`: con gap bajista, a la apertura (peor que el nivel).
+3. Si sólo `High >= TP`, sale por `TAKE_PROFIT` al nivel del TP, incluso con gap alcista (no se asume mejora de precio).
+
+Salida temporal: si tras `max_holding_sessions = 20` sesiones (la de entrada cuenta como la primera) la posición sigue abierta, se cierra en la apertura de la sesión 21 (`sessions_since_entry = 20`). Si esa apertura ya está bajo el SL, se registra como `STOP_LOSS`.
+
+Fin de datos: las posiciones abiertas se cierran al último cierre disponible con motivo `END_OF_DATA`, para no dejar PnL sin realizar.
+
+`Trade` registra: señal, entrada y salida (timestamps), cantidad, precios teórico y ejecutado de entrada y salida, ATR de entrada, SL, TP, riesgo planificado, comisiones, coste de slippage, costes totales, PnL bruto, PnL neto, retorno porcentual y motivo de salida.
+
+```text
+gross_pnl   = (salida_teórica - entrada_teórica) * cantidad
+total_costs = comisión_entrada + comisión_salida + slippage
+net_pnl     = gross_pnl - total_costs
+return_pct  = net_pnl / (entrada_ejecutada * cantidad + comisión_entrada)
+```
+
+`BacktestEngine.run(bars_by_symbol)`, en cada sesión:
+
+1. Apertura: salidas temporales.
+2. Apertura: entradas de las señales del cierre anterior del símbolo → anti-gap → `PortfolioAllocator` con el equity valorado al cierre anterior.
+3. Barra: SL/TP de todas las posiciones abiertas, incluida la de la propia sesión de entrada.
+4. Cierre: valoración a mercado y punto de la curva de equity (`EquityPoint`).
+
+Las señales se precalculan por símbolo con `LongSignalGenerator`, cuya invariancia a barras futuras está cubierta por tests; la señal de la barra `k` sólo se usa en la barra `k+1`. `BacktestParameters` se devuelve con el resultado y exige que la comisión del sizing coincida con la del `CostModel`.
+
+Limitaciones actuales:
+
+- Opera sobre barras diarias: la granularidad intradía queda pendiente del proveedor. Con barras diarias, la regla de prioridad del SL se aplica siempre que la vela toque ambos niveles.
+- Las sesiones se cuentan con las barras de cada símbolo, sin calendario de mercado.
+- Una salida por SL/TP durante la barra no libera plaza para entradas de esa misma apertura.
+
 ---
 
 ## 8. Archivos importantes
@@ -514,6 +565,16 @@ src/algo_trading/portfolio/position_sizing.py
 src/algo_trading/portfolio/exit_levels.py
 src/algo_trading/portfolio/portfolio_state.py
 src/algo_trading/portfolio/allocator.py
+```
+
+### Ejecución y backtesting
+
+```text
+src/algo_trading/execution/costs.py
+src/algo_trading/execution/gap_filter.py
+src/algo_trading/execution/exit_rules.py
+src/algo_trading/execution/trade.py
+src/algo_trading/backtesting/engine.py
 ```
 
 ### Repositorios
@@ -715,6 +776,7 @@ Completado:
 - DTO de lectura para dividendos en `CorporateActionQueryRepository`.
 - Hito 1: indicadores (SMA, Bollinger, ATR Wilder) y generación de señales Long.
 - Hito 2: position sizing, niveles SL/TP, estado de portfolio y priorización de señales simultáneas.
+- Hito 3: costes, escudo anti-gap, reglas de salida con prioridad del SL, salida temporal, registro de trades y motor de backtesting diario.
 
 Orden inmediato:
 
@@ -738,9 +800,9 @@ Python: 3.13.3
 Sistema operativo: Windows 11
 IDE: VS Code
 Base de datos: MySQL 8.0 mediante Docker Compose
-Estado: infraestructura, persistencia, snapshots, trazabilidad, indicadores, señales Long y gestión monetaria implementados
+Estado: infraestructura, persistencia, snapshots, trazabilidad, indicadores, señales Long, gestión monetaria y backtesting diario implementados
 Validaciones: pytest, ruff y mypy están en verde
-Siguiente tarea: simulador de ejecución y backtesting (Hito 3)
+Siguiente tarea: métricas y reportes (Hito 4)
 Fuente de verdad: docs/project-status.md
 ```
 
