@@ -539,6 +539,37 @@ data_snapshots           5
 
 Verificado: AAPL 2020-08-28 raw 499.23 → ajustado 124.81 (factor 0.25); GOOGL 2022-07-15 raw 2235.55 → ajustado 111.78 (factor 0.05). Los ajustados coinciden con los precios de Yahoo. Una segunda ejecución es idempotente.
 
+### Backtest sobre datos de MySQL
+
+`BacktestRunService` (`backtesting/run_service.py`) lee `market_bars_adjusted` (sólo lectura) por símbolo, `source` y `adjustment_version`, convierte las filas a `MarketBar` con timestamp UTC, ejecuta `BacktestEngine` y devuelve el `BacktestReport`.
+
+- Periodo con fechas de sesión inclusivas (internamente `[start, end + 1 día)` sobre el repositorio semiabierto).
+- Si algún símbolo no tiene barras en el periodo, falla con `MissingMarketDataError` indicando cuáles.
+
+CLI `algo-backtest` (`cli/backtest.py`):
+
+```powershell
+algo-backtest                                  # universo inicial, 2020-01-01 → ayer
+algo-backtest --symbols AAPL MSFT --start 2021-01-01 --end 2025-12-31 --gap-threshold-atr 1
+```
+
+- Capital inicial y máximo de posiciones por defecto desde `configs/environments/local.yaml`; costes del perfil base.
+- Escribe `reports/<nombre>.json` y `reports/<nombre>.md`; nombre por defecto `backtest_<símbolos>_<inicio>_<fin>`. `reports/` está en `.gitignore`.
+- El informe es determinista: dos ejecuciones con los mismos datos producen ficheros idénticos.
+
+Primer backtest real (2026-10-22): AAPL, GOOGL, MSFT, QQQ, SPY; 2020-01-02 → 2026-10-21; capital 100.000; parámetros v1.
+
+```text
+                    Estrategia    Buy & Hold
+Retorno acumulado      5.11 %      274.02 %
+Maximum Drawdown       3.41 %       33.36 %
+Trades 158 · Win Rate 41.77 % · Profit Factor 1.27 · Expectancy 0.10 R
+Salidas: STOP_LOSS 91, TAKE_PROFIT 61, TIME_EXIT 6 · GAP_FILTERED 18 · rechazos 27
+Tiempo en mercado 31.52 % · exposición media 4.86 % · costes 3,165.49
+```
+
+Lectura: la estrategia tiene expectativa positiva pero baja exposición (operaciones de ~5 sesiones con un 10 % máximo por posición), por lo que el capital pasa la mayor parte del tiempo en cash. Los costes consumen cerca del 38 % del beneficio bruto. Buy & Hold no incluye dividendos (la estrategia tampoco los acredita aún).
+
 ### Métricas e informes (Hito 4)
 
 `calculate_performance_metrics(result, bars_by_symbol)` (`analytics/metrics.py`):
@@ -611,6 +642,8 @@ src/algo_trading/data/providers/protocol.py
 src/algo_trading/data/providers/in_memory.py
 src/algo_trading/data/providers/yfinance.py
 src/algo_trading/cli/ingest.py
+src/algo_trading/backtesting/run_service.py
+src/algo_trading/cli/backtest.py
 ```
 
 ### Dominio
@@ -860,15 +893,17 @@ Completado:
 - Hito 3: costes, escudo anti-gap, reglas de salida con prioridad del SL, salida temporal, registro de trades y motor de backtesting diario.
 - Hito 4: métricas de performance, comparación Buy & Hold y exportación del informe en JSON/Markdown.
 - Ingesta real: `YFinanceProvider`, CLI `algo-ingest` y carga inicial de AAPL, MSFT, GOOGL, SPY y QQQ (2020 → 2026-10-21).
+- Backtest sobre MySQL: `BacktestRunService` y CLI `algo-backtest` con informe JSON/Markdown.
 
 Orden inmediato:
 
 1. Revisar y unificar la semántica temporal de rangos: el proveedor y la ingesta usan límites inclusivos (`start <= x <= end`), mientras que los repositorios de lectura usan rangos semiabiertos (`start <= x < end`).
 2. Integrar `pandas-market-calendars` para validar que las series no tengan huecos de sesiones antes de calcular indicadores y contar sesiones.
-3. Servicio que cargue barras ajustadas desde MySQL, ejecute el backtest y guarde el informe (y, si se requiere, persistir `BacktestRun`, `Trade` y `EquitySnapshot`).
-4. Reintentos con backoff para el proveedor real y validación de calidad de datos (huecos, saltos de precio).
-5. Decidir proveedor y granularidad intradía antes de implementar su adaptador y la simulación intradía.
-6. Perfiles de costes optimista y conservador, y análisis de sensibilidad del umbral anti-gap.
+3. Acreditar dividendos en cash (estrategia y Buy & Hold) en la fecha ex-dividendo.
+4. Perfiles de costes optimista y conservador, y análisis de sensibilidad del umbral anti-gap.
+5. Persistir `BacktestRun`, `Trade` y `EquitySnapshot` en MySQL si se necesita comparar ejecuciones desde la base de datos.
+6. Reintentos con backoff para el proveedor real y validación de calidad de datos (huecos, saltos de precio).
+7. Decidir proveedor y granularidad intradía antes de implementar su adaptador y la simulación intradía.
 
 No conectar todavía un proveedor externo directamente a la estrategia.
 

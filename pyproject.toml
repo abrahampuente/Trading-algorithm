@@ -29,6 +29,7 @@ dev = [
 
 [project.scripts]
 algo-ingest = "algo_trading.cli.ingest:main"
+algo-backtest = "algo_trading.cli.backtest:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

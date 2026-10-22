@@ -43,3 +43,6 @@ logs/
 *.db
 *.sqlite
 *.sqlite3
+
+# Informes generados por algo-backtest
+reports/
