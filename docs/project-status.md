@@ -236,7 +236,7 @@ src/algo_trading/
 ├── execution/
 ├── portfolio/
 ├── backtesting/
-└── analytics/        # Pendiente
+└── analytics/
 ```
 
 ---
@@ -463,7 +463,7 @@ Reglas de salida Long (`evaluate_bar_exit`), con `SL = entrada_ejecutada - ATR` 
 
 1. Si `Low <= SL`, sale por `STOP_LOSS` aunque la barra también alcance el TP: el SL tiene prioridad absoluta.
 2. El SL se ejecuta en `min(Open, SL)`: con gap bajista, a la apertura (peor que el nivel).
-3. Si sólo `High >= TP`, sale por `TAKE_PROFIT` al nivel del TP, incluso con gap alcista (no se asume mejora de precio).
+3. Si sólo `High >= TP`, sale por `TAKE_PROFIT` al nivel del TP, incluso con gap alcista (no se asume mejora de precio). Decisión confirmada como política conservadora de la fase inicial.
 
 Salida temporal: si tras `max_holding_sessions = 20` sesiones (la de entrada cuenta como la primera) la posición sigue abierta, se cierra en la apertura de la sesión 21 (`sessions_since_entry = 20`). Si esa apertura ya está bajo el SL, se registra como `STOP_LOSS`.
 
@@ -492,6 +492,31 @@ Limitaciones actuales:
 - Opera sobre barras diarias: la granularidad intradía queda pendiente del proveedor. Con barras diarias, la regla de prioridad del SL se aplica siempre que la vela toque ambos niveles.
 - Las sesiones se cuentan con las barras de cada símbolo, sin calendario de mercado.
 - Una salida por SL/TP durante la barra no libera plaza para entradas de esa misma apertura.
+
+### Métricas e informes (Hito 4)
+
+`calculate_performance_metrics(result, bars_by_symbol)` (`analytics/metrics.py`):
+
+- **Retorno acumulado**: `cash_final / capital_inicial - 1`. El equity final es el cash tras cerrar todas las posiciones, incluidas las `END_OF_DATA`.
+- **Curva de equity**: la del motor (`EquityPoint` al cierre de cada sesión), incluida en el informe.
+- **Trades** (PnL neto; ganador si `net_pnl > 0`, el empate cuenta como perdedor):
+  - Win Rate = ganadores / trades.
+  - Profit Factor = beneficio bruto de ganadores / |pérdidas|; `None` si no hay pérdidas.
+  - Expectancy = PnL neto medio por trade; Expectancy en R = media de `net_pnl / riesgo_planificado`.
+  - Ganancia media, pérdida media, costes totales y salidas por motivo.
+  - Duración media en sesiones (`sessions_since_entry`) y en días naturales.
+- **Maximum Drawdown**: máxima caída porcentual desde un máximo previo, con el capital inicial como primer máximo; incluye importe y timestamps de pico y valle.
+- **Exposición**: tiempo en mercado (sesiones con posiciones / total) y exposición media (`valor_mercado / equity`).
+- **Buy & Hold**: equiponderado sobre los mismos símbolos; compra en la apertura de la primera barra de cada símbolo y venta al último cierre, con los mismos costes y unidades fraccionarias. Incluye retorno, MDD y exceso de retorno de la estrategia.
+- Las ratios sin denominador válido son `None` (`n/d` en Markdown).
+
+`build_report` → `BacktestReport` (`analytics/report.py`):
+
+- Contiene versión del informe, símbolos, periodo, parámetros completos, métricas, trades, entradas `GAP_FILTERED`, rechazos y curva de equity.
+- `report_to_json`: JSON con los `Decimal` como texto (sin pérdida de precisión); se puede reconstruir con `BacktestReport.model_validate_json`.
+- `report_to_markdown`: resumen legible con tablas de parámetros, resultados frente a Buy & Hold, estadísticas de trades y registro de operaciones.
+- `write_report(report, directorio, nombre)`: escribe `<nombre>.json` y `<nombre>.md`.
+- El informe no incluye la fecha de generación, por lo que es determinista: el mismo backtest produce exactamente el mismo informe.
 
 ---
 
@@ -575,6 +600,13 @@ src/algo_trading/execution/gap_filter.py
 src/algo_trading/execution/exit_rules.py
 src/algo_trading/execution/trade.py
 src/algo_trading/backtesting/engine.py
+```
+
+### Métricas e informes
+
+```text
+src/algo_trading/analytics/metrics.py
+src/algo_trading/analytics/report.py
 ```
 
 ### Repositorios
@@ -777,13 +809,16 @@ Completado:
 - Hito 1: indicadores (SMA, Bollinger, ATR Wilder) y generación de señales Long.
 - Hito 2: position sizing, niveles SL/TP, estado de portfolio y priorización de señales simultáneas.
 - Hito 3: costes, escudo anti-gap, reglas de salida con prioridad del SL, salida temporal, registro de trades y motor de backtesting diario.
+- Hito 4: métricas de performance, comparación Buy & Hold y exportación del informe en JSON/Markdown.
 
 Orden inmediato:
 
 1. Revisar y unificar la semántica temporal de rangos: el proveedor y la ingesta usan límites inclusivos (`start <= x <= end`), mientras que los repositorios de lectura usan rangos semiabiertos (`start <= x < end`).
-2. Integrar `pandas-market-calendars` para validar que las series no tengan huecos de sesiones antes de calcular indicadores.
-3. Diseñar el adaptador del proveedor externo real sin conectarlo todavía a la estrategia.
-4. Decidir proveedor y granularidad intradía antes de implementar su adaptador.
+2. Integrar `pandas-market-calendars` para validar que las series no tengan huecos de sesiones antes de calcular indicadores y contar sesiones.
+3. Servicio que cargue barras ajustadas desde MySQL, ejecute el backtest y guarde el informe (y, si se requiere, persistir `BacktestRun`, `Trade` y `EquitySnapshot`).
+4. Diseñar el adaptador del proveedor externo real sin conectarlo todavía a la estrategia.
+5. Decidir proveedor y granularidad intradía antes de implementar su adaptador y la simulación intradía.
+6. Perfiles de costes optimista y conservador, y análisis de sensibilidad del umbral anti-gap.
 
 No conectar todavía un proveedor externo directamente a la estrategia.
 
@@ -800,9 +835,9 @@ Python: 3.13.3
 Sistema operativo: Windows 11
 IDE: VS Code
 Base de datos: MySQL 8.0 mediante Docker Compose
-Estado: infraestructura, persistencia, snapshots, trazabilidad, indicadores, señales Long, gestión monetaria y backtesting diario implementados
+Estado: v1 completa en datos diarios: persistencia, snapshots, indicadores, señales Long, gestión monetaria, backtesting, métricas e informes
 Validaciones: pytest, ruff y mypy están en verde
-Siguiente tarea: métricas y reportes (Hito 4)
+Siguiente tarea: unificar la semántica de rangos e integrar el calendario de mercado
 Fuente de verdad: docs/project-status.md
 ```
 
