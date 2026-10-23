@@ -683,6 +683,43 @@ Buy & Hold: 282.93 %
 
 Lectura: con TP fijo en 2 × ATR, ampliar el stop sube el Win Rate y el Profit Factor; ampliar la exposición sube el retorno y el MDD casi en proporción, y a partir del 15 % la falta de cash limita las entradas. Es una optimización dentro de la muestra (un solo periodo y cinco activos muy correlacionados): antes de cambiar los parámetros v1 conviene validarla fuera de muestra (walk-forward).
 
+### Walk-Forward Optimization
+
+`analytics/walk_forward.py` mide la solidez fuera de muestra de la rejilla de parámetros (SL × ATR y exposición):
+
+- `build_windows`: ventanas rodantes IS de `in_sample_months` (por defecto 36) seguidas de OOS de `out_of_sample_months` (por defecto 12); paso = OOS por defecto, de modo que las OOS son contiguas y no se solapan (un paso menor se rechaza). La última OOS se recorta al fin de los datos y se marca como parcial.
+- En cada IS se ejecuta la rejilla y `select_best` elige la combinación con mayor Profit Factor (o Sharpe con `--wf-metric sharpe`). Sólo son elegibles las combinaciones con al menos `min_trades` trades (por defecto 10); Profit Factor sin pérdidas cuenta como infinito; los empates mantienen el orden de la rejilla.
+- La combinación elegida se aplica sin cambios a la OOS siguiente. Las OOS se encadenan: cada una empieza con el equity final de la anterior y forman la curva OOS.
+- Sin sesgo: cada ejecución recibe sólo barras hasta el fin de su ventana; las anteriores sólo calientan indicadores mediante `BacktestEngine.run(..., trading_start=...)`, que bloquea entradas y equity antes del inicio. Se usa siempre el historial desde el inicio de los datos, así los indicadores (incluido el ATR de Wilder) son idénticos en todas las ventanas. Las posiciones abiertas al final de una ventana se cierran a su último cierre.
+- Métricas por periodo: retorno acumulado y anualizado (`(1+R)^(365.25/días) - 1`), MDD, Profit Factor, Sharpe anualizado (retornos diarios, tasa libre 0, `sqrt(252)`), Win Rate y trades.
+- WFE = retorno anualizado OOS / retorno anualizado IS. Por ventana usa la combinación elegida; el global usa la curva OOS encadenada y la media de los IS elegidos. No calculable si el IS anualizado no es positivo. WFE > 50 % se considera robusto.
+- Los datos se leen una vez de MySQL (`BacktestRunService.prepare`); el análisis corre en memoria y no persiste ejecuciones.
+- Tests: un fallo inyectado que deja ver datos posteriores a la ventana hace fallar los tests de no look-ahead.
+
+CLI:
+
+```powershell
+algo-backtest --walk-forward                                   # IS 36 / OOS 12, Profit Factor
+algo-backtest --walk-forward --is-months 24 --oos-months 6 --wf-metric sharpe --min-trades 5
+```
+
+Escribe `reports/walk_forward_<símbolos>_<inicio>_<fin>_<perfil>_is<IS>-oos<OOS>_<métrica>.md|.json` con el resumen OOS, una fila por ventana, la rejilla IS completa de cada ventana y notas de método.
+
+Resultado real (2026-10-23; perfil base; IS 36 / OOS 12; 40 s):
+
+```text
+#  OOS                        Elegida (SL, exp.)  Anual. IS  Anual. OOS  PF OOS  Trades  WFE
+1  2023-01-01 → 2023-12-31    2.0, 10 %           2.19 %      0.98 %     1.28    25       44.96 %
+2  2024-01-01 → 2024-12-31    2.0, 10 %           1.72 %     -0.74 %     0.81    24      -42.96 %
+3  2025-01-01 → 2025-12-31    1.5, 10 %           0.84 %      1.18 %     1.41    23      140.21 %
+4  2026-01-01 → 2026-10-21    1.0, 20 %           1.66 %      2.76 %     1.76    13      165.76 %
+
+OOS encadenado: retorno 3.66 %, anualizado 0.95 %, MDD 2.96 %, PF 1.28, Sharpe 0.43, 85 trades
+IS anualizado medio 1.60 % → WFE 59.14 % (selección por Sharpe: OOS 4.08 %, WFE 59.31 %)
+```
+
+Lectura: el WFE supera el 50 %, pero se calcula sobre retornos anualizados muy pequeños (≈1-2 %), por lo que es sensible a pocas operaciones; la ventana 2024 fue negativa y los parámetros elegidos cambian entre ventanas. La estrategia conserva fuera de muestra parte de su ventaja, pero con un retorno absoluto muy inferior a Buy & Hold.
+
 ### Métricas e informes (Hito 4)
 
 `calculate_performance_metrics(result, bars_by_symbol)` (`analytics/metrics.py`):
@@ -763,6 +800,7 @@ src/algo_trading/persistence/repositories/backtest_run_repository.py
 migrations/versions/9c4d5e6f7a8b_create_backtest_results.py
 migrations/versions/a1d2e3f4b5c6_add_sweep_id_to_backtest_runs.py
 src/algo_trading/backtesting/sensitivity.py
+src/algo_trading/analytics/walk_forward.py
 ```
 
 ### Dominio
@@ -1006,10 +1044,11 @@ Completado:
 - Persistencia y comparación de ejecuciones (`backtest_runs`, `backtest_trades`, `backtest_equity_snapshots`).
 - Perfiles de costes optimista, base y conservador seleccionables desde la CLI.
 - Multiplicador de stop loss configurable y barrido de parámetros (SL × exposición) persistido con `sweep_id`.
+- Walk-Forward Optimization con curva OOS encadenada y Eficiencia Walk-Forward (`--walk-forward`).
 
 Orden inmediato:
 
-1. Validación fuera de muestra (walk-forward) de los parámetros del barrido antes de cambiar los valores v1; ampliar el barrido al umbral anti-gap y al TP.
+1. Ampliar el walk-forward: más activos (menos correlación), umbral anti-gap y TP en la rejilla, y persistir sus resultados si se quieren comparar desde MySQL.
 2. Reintentos con backoff para el proveedor real y validación de calidad de datos (saltos de precio, volumen cero).
 3. Decidir proveedor y granularidad intradía antes de implementar su adaptador y la simulación intradía (usando horarios y cierres tempranos del calendario).
 
@@ -1028,9 +1067,9 @@ Python: 3.13.3
 Sistema operativo: Windows 11
 IDE: VS Code
 Base de datos: MySQL 8.0 mediante Docker Compose
-Estado: v1 completa en datos diarios: ingesta real, calendario NYSE, dividendos, indicadores, señales Long, gestión monetaria, backtesting persistido, perfiles de costes, barridos de parámetros, métricas e informes
+Estado: v1 completa en datos diarios: ingesta real, calendario NYSE, dividendos, indicadores, señales Long, gestión monetaria, backtesting persistido, perfiles de costes, barridos de parámetros, walk-forward, métricas e informes
 Validaciones: pytest, ruff y mypy están en verde
-Siguiente tarea: validación walk-forward de los parámetros del barrido
+Siguiente tarea: ampliar universo y rejilla del walk-forward
 Fuente de verdad: docs/project-status.md
 ```
 
@@ -1044,8 +1083,8 @@ ruff format --check .
 mypy src
 ```
 
-No regenerar módulos ya implementados. Continuar desde la validación walk-forward de los parámetros del barrido.
+No regenerar módulos ya implementados. Continuar desde la ampliación del universo y de la rejilla del walk-forward.
 
 Al abrir el siguiente chat, bastará con indicar:
 
-> Este proyecto continúa desde `docs/project-status.md`. Lee ese estado y no regeneres módulos ya implementados. El siguiente paso es la validación walk-forward de los parámetros del barrido (stop loss y exposición).
+> Este proyecto continúa desde `docs/project-status.md`. Lee ese estado y no regeneres módulos ya implementados. El siguiente paso es ampliar el universo de activos y la rejilla del walk-forward.

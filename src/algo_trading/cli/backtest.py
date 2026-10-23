@@ -8,6 +8,7 @@ Uso:
     algo-backtest --cost-profile conservador --stop-loss-atr 1.5
     algo-backtest --sweep
     algo-backtest --sweep --sl-multiples 1 2 --exposures 0.10 0.20
+    algo-backtest --walk-forward --is-months 36 --oos-months 12
     algo-backtest --list-runs 10
 
 Lee `market_bars_adjusted` y los dividendos, valida las series contra el
@@ -18,6 +19,11 @@ escribe el informe en `<output-dir>/<name>.json` y `<output-dir>/<name>.md`.
 Con `--sweep` ejecuta un backtest por combinación de multiplicador de stop
 loss y exposición máxima por posición, guarda todas las ejecuciones con el
 mismo `sweep_id` y escribe una tabla comparativa.
+
+Con `--walk-forward` optimiza la misma rejilla en ventanas In-Sample
+rodantes, aplica la combinación elegida a la ventana Out-of-Sample siguiente
+y escribe `reports/walk_forward_*.md` con la curva OOS encadenada y la
+Eficiencia Walk-Forward (WFE).
 """
 
 import argparse
@@ -29,6 +35,13 @@ from pathlib import Path
 from sqlalchemy.orm import Session
 
 from algo_trading.analytics.report import write_report
+from algo_trading.analytics.walk_forward import (
+    SelectionMetric,
+    WalkForwardAnalyzer,
+    WalkForwardConfig,
+    WalkForwardReport,
+    write_walk_forward_report,
+)
 from algo_trading.backtesting.engine import BacktestParameters
 from algo_trading.backtesting.run_service import (
     BacktestRunOutcome,
@@ -141,6 +154,41 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=Decimal,
         default=list(DEFAULT_MAX_POSITION_EXPOSURES),
         help="Exposiciones máximas del barrido (por defecto: 0.10 0.15 0.20).",
+    )
+    parser.add_argument(
+        "--walk-forward",
+        action="store_true",
+        help="Walk-forward: optimiza la rejilla en IS y la aplica en OOS.",
+    )
+    parser.add_argument(
+        "--is-months",
+        type=int,
+        default=36,
+        help="Meses de cada ventana In-Sample (por defecto: 36).",
+    )
+    parser.add_argument(
+        "--oos-months",
+        type=int,
+        default=12,
+        help="Meses de cada ventana Out-of-Sample (por defecto: 12).",
+    )
+    parser.add_argument(
+        "--wf-step-months",
+        type=int,
+        default=None,
+        help="Desplazamiento entre ventanas (por defecto: --oos-months).",
+    )
+    parser.add_argument(
+        "--wf-metric",
+        choices=[metric.value for metric in SelectionMetric],
+        default=SelectionMetric.PROFIT_FACTOR.value,
+        help="Métrica para elegir la combinación IS (por defecto: profit_factor).",
+    )
+    parser.add_argument(
+        "--min-trades",
+        type=int,
+        default=10,
+        help="Trades IS mínimos para que una combinación sea elegible.",
     )
     parser.add_argument(
         "--list-runs",
@@ -258,6 +306,53 @@ def run_sweep_command(
     return report, json_path, markdown_path
 
 
+def run_walk_forward_command(
+    arguments: argparse.Namespace,
+    session_factory: Callable[[], Session],
+    settings: ApplicationSettings,
+    calendar: TradingCalendar | None,
+) -> tuple[WalkForwardReport, Path, Path]:
+    """Carga los datos una vez de MySQL y ejecuta el walk-forward en memoria."""
+    request = build_request(arguments, settings)
+    config = WalkForwardConfig(
+        in_sample_months=arguments.is_months,
+        out_of_sample_months=arguments.oos_months,
+        step_months=arguments.wf_step_months,
+        selection_metric=SelectionMetric(arguments.wf_metric),
+        min_trades=arguments.min_trades,
+        grid=ParameterGrid(
+            stop_loss_atr_multiples=tuple(arguments.sl_multiples),
+            max_position_exposures=tuple(arguments.exposures),
+        ),
+    )
+
+    with session_factory() as session:
+        data = BacktestRunService(session, calendar=calendar).prepare(request)
+
+    report = WalkForwardAnalyzer(
+        data.bars_by_symbol,
+        dividends_by_symbol=data.dividends_by_symbol,
+        trading_sessions=data.trading_sessions,
+        trading_calendar=calendar.name if calendar is not None else None,
+    ).run(request.parameters, config, start=request.start, end=request.end)
+
+    name = arguments.name or (
+        "walk_forward_"
+        + default_report_name(request.symbols, request.start, request.end).removeprefix(
+            "backtest_"
+        )
+        + f"_{request.parameters.cost_profile}"
+        + f"_is{config.in_sample_months}-oos{config.out_of_sample_months}"
+        + f"_{config.selection_metric}"
+    )
+    json_path, markdown_path = write_walk_forward_report(
+        report,
+        arguments.output_dir,
+        name,
+    )
+    return report, json_path, markdown_path
+
+
 def format_summary(
     outcome: BacktestRunOutcome,
     json_path: Path,
@@ -318,6 +413,55 @@ def format_sweep_summary(
     return "\n".join(lines)
 
 
+def format_walk_forward_summary(
+    report: WalkForwardReport,
+    json_path: Path,
+    markdown_path: Path,
+) -> str:
+    config = report.config
+    oos = report.out_of_sample
+    lines = [
+        f"Walk-forward: IS {config.in_sample_months} m / OOS "
+        f"{config.out_of_sample_months} m, selección por {config.selection_metric}",
+        f"Símbolos: {', '.join(report.symbols)}  "
+        f"Costes: {report.base_parameters.cost_profile}",
+        "",
+        f"{'#':>2} {'OOS':<25} {'SL':>4} {'exp.':>7} {'anual. IS':>10} "
+        f"{'anual. OOS':>10} {'PF OOS':>6} {'trades':>6} {'WFE':>9}",
+    ]
+
+    for result in report.windows:
+        window = result.window
+        lines.append(
+            f"{window.index:>2} {window.out_of_sample_start} → "
+            f"{window.out_of_sample_end} "
+            f"{result.selected.stop_loss_atr_multiple!s:>4} "
+            f"{_pct(result.selected.max_position_exposure):>7} "
+            f"{_pct(result.selected.annualized_return):>10} "
+            f"{_pct(result.out_of_sample.annualized_return):>10} "
+            f"{_ratio(result.out_of_sample.profit_factor):>6} "
+            f"{result.out_of_sample.total_trades:>6} "
+            f"{_pct(result.walk_forward_efficiency):>9}"
+        )
+
+    robust = {True: "sí", False: "no", None: "n/d"}[report.is_robust]
+    lines.extend(
+        [
+            "",
+            f"OOS encadenado: retorno {_pct(oos.cumulative_return)}  "
+            f"anualizado {_pct(oos.annualized_return)}  "
+            f"MDD {_pct(oos.max_drawdown_pct)}  PF {_ratio(oos.profit_factor)}  "
+            f"Sharpe {_ratio(oos.sharpe_ratio)}  trades {oos.total_trades}",
+            f"IS anualizado medio: {_pct(report.mean_in_sample_annualized_return)}  "
+            f"WFE: {_pct(report.walk_forward_efficiency)}  "
+            f"Robusta (WFE > 50 %): {robust}",
+            f"Informe JSON: {json_path}",
+            f"Informe Markdown: {markdown_path}",
+        ]
+    )
+    return "\n".join(lines)
+
+
 def format_runs(runs: Sequence[BacktestRunSummary]) -> str:
     if not runs:
         return "No hay ejecuciones guardadas."
@@ -362,6 +506,16 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     settings = ApplicationSettings.from_yaml()
     calendar = build_calendar(arguments.calendar)
+
+    if arguments.walk_forward:
+        wf_report, json_path, markdown_path = run_walk_forward_command(
+            arguments,
+            session_factory=SessionFactory,
+            settings=settings,
+            calendar=calendar,
+        )
+        print(format_walk_forward_summary(wf_report, json_path, markdown_path))
+        return 0
 
     if arguments.sweep:
         report, json_path, markdown_path = run_sweep_command(

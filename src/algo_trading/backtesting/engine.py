@@ -148,6 +148,12 @@ class BacktestEngine:
 
     Los dividendos deben expresarse en la misma escala que las barras (para
     barras ajustadas por splits, dividendos ajustados por splits).
+
+    Con `trading_start`, las barras anteriores sólo sirven de historial para
+    los indicadores: no se abren posiciones ni se registra equity antes de
+    esa fecha. Permite evaluar una ventana (p. ej. walk-forward) con los
+    indicadores ya calentados y sin usar datos posteriores a la ventana, que
+    se limita pasando sólo las barras hasta su fin.
     """
 
     def __init__(self, parameters: BacktestParameters) -> None:
@@ -160,6 +166,7 @@ class BacktestEngine:
         bars_by_symbol: Mapping[str, Sequence[ExecutionBar]],
         trading_sessions: Sequence[date] | None = None,
         dividends_by_symbol: Mapping[str, Sequence[CorporateDividend]] | None = None,
+        trading_start: date | None = None,
     ) -> BacktestResult:
         parameters = self._parameters
         costs = parameters.costs
@@ -269,10 +276,11 @@ class BacktestEngine:
                 trades.append(trade)
                 del open_trades[symbol]
 
-            # 2. Entradas a la apertura.
+            # 2. Entradas a la apertura (sólo dentro de la ventana de trading).
             candidates: list[EntryCandidate] = []
+            is_trading = trading_start is None or session_date >= trading_start
 
-            for symbol in sorted(todays_index):
+            for symbol in sorted(todays_index if is_trading else ()):
                 index = todays_index[symbol]
                 signal = signals_by_symbol[symbol].get(index - 1)
 
@@ -380,6 +388,9 @@ class BacktestEngine:
                 ),
                 Decimal("0"),
             )
+            if not is_trading:
+                continue
+
             equity_curve.append(
                 EquityPoint(
                     timestamp=session,

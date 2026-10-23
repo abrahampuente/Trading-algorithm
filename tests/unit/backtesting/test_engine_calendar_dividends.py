@@ -177,3 +177,34 @@ def test_rejects_dividends_with_wrong_symbol() -> None:
 
     with pytest.raises(ValueError, match="dividendos de AAA"):
         run(time_exit_series(), dividends=[wrong])
+
+
+# --- Ventana de trading -------------------------------------------------------
+
+
+def test_trading_start_blocks_entries_and_equity_before_it() -> None:
+    bars = time_exit_series()
+
+    result = BacktestEngine(BacktestParameters(initial_cash=INITIAL_CASH)).run(
+        {"AAA": bars},
+        trading_start=day(22),
+    )
+
+    # La señal de 20 entraría en 21, antes del inicio: no hay operación.
+    assert result.trades == ()
+    assert result.equity_curve[0].timestamp.date() == day(22)
+    assert result.final_cash == INITIAL_CASH
+
+
+def test_signal_before_trading_start_can_enter_on_first_session() -> None:
+    bars = time_exit_series()
+
+    windowed = BacktestEngine(BacktestParameters(initial_cash=INITIAL_CASH)).run(
+        {"AAA": bars},
+        trading_start=day(21),
+    )
+    full = run(bars)
+
+    assert windowed.trades == full.trades
+    assert windowed.trades[0].signal_timestamp.date() == day(20)
+    assert len(windowed.equity_curve) == len(full.equity_curve) - 21
