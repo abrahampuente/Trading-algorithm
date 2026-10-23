@@ -14,7 +14,25 @@ Hito 4  Scheduler diario/intradía, latencia y notificaciones        pendiente
 Hito 5  Paper trading en vivo de 30-60 sesiones                     pendiente
 ```
 
-Reglas de continuidad (sección 2 de la especificación v2): con las funciones v2 desactivadas, que es su valor por defecto, el backtest de la v1 debe reproducir exactamente su informe; los valores bloqueados de la v1 no cambian sin un nuevo walk-forward; los módulos v1 se amplían con `Protocol` y parámetros opcionales, sin reescribirlos. Aún no hay código v2: el estado implementado sigue siendo el de la v1 descrito abajo.
+Reglas de continuidad (sección 2 de la especificación v2): con las funciones v2 desactivadas, que es su valor por defecto, el backtest de la v1 debe reproducir exactamente su informe; los valores bloqueados de la v1 no cambian sin un nuevo walk-forward; los módulos v1 se amplían con `Protocol` y parámetros opcionales, sin reescribirlos.
+
+### Hito 1 (en curso)
+
+Regresión v1 (`tests/integration/test_v1_regression.py`, contra MySQL; se omite si no está disponible):
+
+- Reejecuta sin persistir el backtest de confirmación con los valores por defecto de `local.yaml` (2020-01-01 → 2026-10-22) y exige el `report_checksum` del run `1fe790dc-6bf2-4c5c-aa41-35186937afc1` (`1e500e90…eed5c`) y sus métricas (equity final, retorno, MDD, Profit Factor, Win Rate, dividendos, 332 trades).
+- Un split nuevo en el universo reescribe el histórico ajustado y cambia el checksum legítimamente: la referencia se regenera de forma explícita.
+
+Paquete `signals/` (no lo usa todavía el motor de backtest; `strategy/` e `indicators/` no cambian):
+
+- `Signal` (`side`, `strategy_id`, `close`, `atr`, `score`, `factors`), `Side` y `SignalGenerator` (`Protocol`).
+- `SignalContext`: series de referencia (SPY, QQQ, ETFs sectoriales, `^VIX`); `until(t)` es una vista hasta `t` inclusive, la única que reciben los filtros.
+- `MomentumBreakoutGenerator` (`momentum_breakout_v1`): envuelve `LongSignalGenerator` y emite exactamente sus señales con `score = momentum`.
+- `CompositeSignalGenerator`: señal base + filtros AND; evalúa todos los filtros, añade sus valores a `factors` como `<filtro>.<valor>` y registra las señales bloqueadas (`FilteredSignal`).
+- Filtros: `RelativeStrengthFilter` (RS frente a SPY/QQQ en `n` sesiones), `SectorRotationFilter` (ranking de ETFs sectoriales por RS, `top_k`), `VolatilityRegimeFilter` (percentil de `ATR / Close`), `VixRegimeFilter` y `BenchmarkTrendFilter` (benchmark sobre su SMA). Si faltan datos rechazan con motivo (`insufficient_history`, `missing_reference_data`, `unmapped_sector`).
+- Tests: equivalencia con la v1, invariancia a barras futuras (símbolo y referencias) y detección de un filtro con fuga de datos.
+
+Pendiente en el Hito 1: ingesta de benchmarks, ETFs sectoriales y `^VIX`; confirmación por volumen; Short y reversión a la media; integración en el motor y walk-forward frente al baseline v1.
 
 ## v1 cerrada (2026-10-23)
 
