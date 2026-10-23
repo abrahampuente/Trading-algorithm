@@ -16,6 +16,7 @@ Uso:
     algo-backtest --use-sector-relative-strength --vix-filter-threshold 25
     algo-backtest --walk-forward --universe diversified --sector-filter-grid off on \
         --report-tag sector_filter
+    algo-backtest --intrabar-resolution
 
 Lee `market_bars_adjusted` y los dividendos, valida las series contra el
 calendario de mercado, ejecuta la estrategia v1, guarda la ejecución en
@@ -36,6 +37,10 @@ señales v1 pasan por los filtros de régimen v2 (`signals/`) con las series de
 referencia de `signals.reference_universe`. Sin esas opciones, el backtest es
 exactamente el de la v1. En walk-forward, `--sector-filter-grid off on` añade
 el filtro sectorial como eje de la rejilla: cada IS decide si usarlo.
+
+Con `--intrabar-resolution`, las velas que tocan SL y TP se resuelven con
+barras de 1 minuto de Alpaca (credenciales en `.env`); sin la opción, el SL
+tiene prioridad como en la v1.
 """
 
 import argparse
@@ -82,7 +87,16 @@ from algo_trading.config.settings import (
     ApplicationSettings,
 )
 from algo_trading.data.market_calendar import DEFAULT_EXCHANGE, TradingCalendar
+from algo_trading.data.providers.alpaca import (
+    AlpacaAdjustment,
+    AlpacaCredentials,
+    AlpacaFeed,
+    AlpacaMarketDataProvider,
+    AlpacaSessionBarSource,
+    RetryPolicy,
+)
 from algo_trading.data.providers.yfinance import YFINANCE_SOURCE
+from algo_trading.engine.intrabar import IntrabarResolver
 from algo_trading.execution.costs import CostModel
 from algo_trading.persistence.repositories.backtest_run_repository import (
     BacktestRunRepository,
@@ -290,6 +304,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "'off on'; por defecto sólo off, la señal v1).",
     )
     parser.add_argument(
+        "--intrabar-resolution",
+        action="store_true",
+        help="Resolver con barras de 1 minuto (Alpaca) las velas que tocan SL y "
+        "TP; sin la opción, prioridad al SL (v1).",
+    )
+    parser.add_argument(
         "--vix-filter-threshold",
         type=Decimal,
         default=None,
@@ -313,6 +333,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     if arguments.sector_filter_grid and not arguments.walk_forward:
         parser.error("--sector-filter-grid sólo se usa con --walk-forward")
 
+    if arguments.intrabar_resolution and (arguments.sweep or arguments.walk_forward):
+        parser.error(
+            "--intrabar-resolution sólo está disponible en un backtest individual"
+        )
+
     return arguments
 
 
@@ -324,6 +349,47 @@ def sector_filter_grid(arguments: argparse.Namespace) -> tuple[bool, ...]:
 
 def needs_reference_series(arguments: argparse.Namespace) -> bool:
     return uses_signal_filters(arguments) or True in sector_filter_grid(arguments)
+
+
+def build_intrabar_resolver(
+    arguments: argparse.Namespace,
+    settings: ApplicationSettings,
+    calendar: TradingCalendar | None,
+) -> IntrabarResolver | None:
+    """Resolver con barras de 1 minuto de Alpaca, o None sin la opción (v1)."""
+    if not arguments.intrabar_resolution:
+        return None
+
+    if calendar is None:
+        raise ValueError("--intrabar-resolution necesita un calendario de mercado")
+
+    if not settings.alpaca_api_key_id or settings.alpaca_api_secret_key is None:
+        raise ValueError(
+            "--intrabar-resolution necesita ALPACA_API_KEY_ID y "
+            "ALPACA_API_SECRET_KEY en el entorno o en .env"
+        )
+
+    intraday = settings.intraday
+    provider = AlpacaMarketDataProvider(
+        AlpacaCredentials(
+            key_id=settings.alpaca_api_key_id,
+            secret_key=settings.alpaca_api_secret_key,
+        ),
+        feed=AlpacaFeed(intraday.feed),
+        # Misma escala que las barras diarias ajustadas (splits-v1).
+        adjustment=AlpacaAdjustment.SPLIT,
+        data_url=intraday.data_url,
+        retry=RetryPolicy(
+            max_attempts=intraday.max_attempts,
+            base_delay_seconds=intraday.base_delay_seconds,
+            max_delay_seconds=intraday.max_delay_seconds,
+        ),
+        timeout_seconds=intraday.timeout_seconds,
+    )
+    return IntrabarResolver(
+        AlpacaSessionBarSource(provider, calendar),
+        price_tolerance=intraday.price_tolerance,
+    )
 
 
 def build_sector_filter(settings: ApplicationSettings) -> SectorRotationFilter:
@@ -494,7 +560,11 @@ def report_label(
     settings: ApplicationSettings,
 ) -> str:
     """`<prefijo>[_<etiqueta>]_<universo o símbolos>_<inicio>_<fin>`."""
-    for tag in (arguments.report_tag, signal_filter_tag(arguments)):
+    for tag in (
+        arguments.report_tag,
+        signal_filter_tag(arguments),
+        "intrabar" if arguments.intrabar_resolution else None,
+    ):
         if tag:
             prefix = f"{prefix}_{tag}"
 
@@ -523,6 +593,7 @@ def run_backtest_command(
             request,
             persist=not arguments.no_persist,
             signal_generator=build_signal_generator(arguments, settings),
+            intrabar_resolver=build_intrabar_resolver(arguments, settings, calendar),
         )
 
     name = arguments.name or report_label("backtest", arguments, request, settings)
@@ -658,6 +729,15 @@ def format_summary(
             f"Filtros v2: {summary.strategy_id}  "
             f"Señales bloqueadas: {summary.filtered_signals}"
             + (f" ({blocked})" if blocked else "")
+        )
+
+    if report.intrabar is not None:
+        intrabar = report.intrabar
+        lines.append(
+            f"Intrabarra: {intrabar.conflicts} velas con SL y TP  "
+            f"TP primero {intrabar.take_profit_first}  "
+            f"SL primero {intrabar.stop_loss_first}  "
+            f"fallback v1 {intrabar.fallbacks}"
         )
 
     lines.extend([f"Informe JSON: {json_path}", f"Informe Markdown: {markdown_path}"])

@@ -256,6 +256,11 @@ def _run_parameters(report: BacktestReport) -> dict[str, Any]:
     if report.signal_filters is not None:
         parameters["signal_filters"] = report.signal_filters.model_dump(mode="json")
 
+    if report.intrabar is not None:
+        parameters["intrabar_resolution"] = report.intrabar.model_dump(
+            mode="json", exclude={"records"}
+        )
+
     return parameters
 
 

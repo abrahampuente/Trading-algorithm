@@ -14,6 +14,7 @@ from algo_trading.data.adjustments.split_adjustment import SplitAdjustmentCalcul
 from algo_trading.data.market_bar import MarketBar
 from algo_trading.data.market_calendar import TradingCalendar
 from algo_trading.domain.corporate_actions.dto import CorporateDividend
+from algo_trading.engine.intrabar import IntrabarResolver
 from algo_trading.persistence.models.adjusted_market_data import MarketBarAdjusted
 from algo_trading.persistence.repositories.adjusted_bar_query_repository import (
     AdjustedMarketBarQueryRepository,
@@ -213,6 +214,7 @@ class BacktestRunService:
         persist: bool = True,
         sweep_id: str | None = None,
         signal_generator: SignalGenerator | None = None,
+        intrabar_resolver: IntrabarResolver | None = None,
     ) -> BacktestRunOutcome:
         return self.run_prepared(
             request,
@@ -220,6 +222,7 @@ class BacktestRunService:
             persist=persist,
             sweep_id=sweep_id,
             signal_generator=signal_generator,
+            intrabar_resolver=intrabar_resolver,
         )
 
     def run_prepared(
@@ -229,6 +232,7 @@ class BacktestRunService:
         persist: bool = True,
         sweep_id: str | None = None,
         signal_generator: SignalGenerator | None = None,
+        intrabar_resolver: IntrabarResolver | None = None,
     ) -> BacktestRunOutcome:
         """
         Ejecuta el backtest con datos ya preparados.
@@ -236,6 +240,8 @@ class BacktestRunService:
         Permite variar `request.parameters` sin volver a leer MySQL (barridos).
         Con `signal_generator`, las señales salen de ese generador con las
         series de referencia preparadas como contexto; sin él, es la v1.
+        Con `intrabar_resolver`, las velas que tocan SL y TP se resuelven con
+        datos intradía bajo demanda.
         """
         result = BacktestEngine(request.parameters).run(
             data.bars_by_symbol,
@@ -247,6 +253,7 @@ class BacktestRunService:
                 if signal_generator is not None
                 else None
             ),
+            intrabar_resolver=intrabar_resolver,
         )
         report = build_report(
             result,

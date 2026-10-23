@@ -10,6 +10,7 @@ from algo_trading.data.market_calendar import (
     check_session_coverage,
 )
 from algo_trading.domain.corporate_actions.dto import CorporateDividend
+from algo_trading.engine.intrabar import IntrabarResolutionRecord, IntrabarResolver
 from algo_trading.execution.costs import CostModel
 from algo_trading.execution.exit_rules import (
     ExitDecision,
@@ -125,6 +126,8 @@ class BacktestResult(BaseModel):
     uses_trading_calendar: bool = False
     signal_strategy_id: str | None = None
     filtered_signals: tuple[FilteredSignal, ...] = ()
+    uses_intrabar_resolution: bool = False
+    intrabar_resolutions: tuple[IntrabarResolutionRecord, ...] = ()
 
 
 class BacktestEngine:
@@ -177,6 +180,12 @@ class BacktestEngine:
     deben ser Long con los factores de banda de la v1 (`long_signal_from_signal`);
     las bloqueadas por filtros quedan en `BacktestResult.filtered_signals`. Sin
     generador, el motor es exactamente el de la v1.
+
+    `intrabar_resolver` sustituye la regla diaria del paso 3 cuando una vela
+    toca SL y TP: decide cuál se alcanzó primero con barras de 1 minuto de esa
+    sesión (o aplica el SL si no puede) y registra cada caso en
+    `BacktestResult.intrabar_resolutions`. Sin resolver, el SL tiene siempre
+    prioridad, como en la v1.
     """
 
     def __init__(self, parameters: BacktestParameters) -> None:
@@ -193,6 +202,7 @@ class BacktestEngine:
         precomputed_signals: Mapping[str, Sequence[LongSignal]] | None = None,
         signal_generator: SignalGenerator | None = None,
         signal_context: SignalContext | None = None,
+        intrabar_resolver: IntrabarResolver | None = None,
     ) -> BacktestResult:
         if precomputed_signals is not None and signal_generator is not None:
             raise ValueError("precomputed_signals y signal_generator son excluyentes")
@@ -251,6 +261,7 @@ class BacktestEngine:
         rejected: list[RejectedCandidate] = []
         equity_curve: list[EquityPoint] = []
         dividend_payments: list[DividendPayment] = []
+        intrabar_resolutions: list[IntrabarResolutionRecord] = []
         previous_session_date: date | None = None
 
         for session in sessions:
@@ -406,12 +417,25 @@ class BacktestEngine:
                 index = todays_index[symbol]
                 bar = series[symbol][index]
                 open_trade = open_trades[symbol]
-                exit_decision = evaluate_bar_exit(
-                    open_price=bar.open,
-                    high=bar.high,
-                    low=bar.low,
-                    levels=open_trade.exit_levels,
-                )
+                if intrabar_resolver is None:
+                    exit_decision = evaluate_bar_exit(
+                        open_price=bar.open,
+                        high=bar.high,
+                        low=bar.low,
+                        levels=open_trade.exit_levels,
+                    )
+                else:
+                    exit_decision, resolution = intrabar_resolver.resolve(
+                        symbol,
+                        session,
+                        open_price=bar.open,
+                        high=bar.high,
+                        low=bar.low,
+                        levels=open_trade.exit_levels,
+                    )
+
+                    if resolution is not None:
+                        intrabar_resolutions.append(resolution)
 
                 if exit_decision is None:
                     continue
@@ -481,6 +505,8 @@ class BacktestEngine:
                 signal_generator.strategy_id if signal_generator is not None else None
             ),
             filtered_signals=tuple(filtered_signals),
+            uses_intrabar_resolution=intrabar_resolver is not None,
+            intrabar_resolutions=tuple(intrabar_resolutions),
         )
 
     @staticmethod

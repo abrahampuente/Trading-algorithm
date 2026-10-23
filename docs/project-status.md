@@ -98,6 +98,39 @@ Lectura:
 
 Pendiente en el Hito 1: filtro sectorial con topes de exposición mayores; confirmación por volumen; Short y reversión a la media (requieren generalizar `EntryCandidate` más allá de `LongSignal`).
 
+### Hito 2 (en curso): datos intradía y resolución intrabarra SL / TP
+
+Proveedor `AlpacaMarketDataProvider` (`data/providers/alpaca.py`), Alpaca Market Data API v2 (`GET /v2/stocks/bars`):
+
+- `MarketDataProvider` de barras `1m` / `5m` (`Timeframe.ONE_MINUTE` / `FIVE_MINUTES`); `source = alpaca-iex` o `alpaca-sip` según el feed; timestamp = inicio de la barra en UTC; paginación con `next_page_token`.
+- `adjustment = raw` por defecto (capa raw); `split` da la escala de `market_bars_adjusted` (`splits-v1`), la que usa la resolución intrabarra. No sirve acciones corporativas (llegan con el proveedor diario).
+- JSON leído como `Decimal` (sin `float`), 8 decimales; barras con OHLC inconsistente descartadas en `rejected_bars`. Snapshot con checksum v1 y `snapshot_id = alpaca-<feed>:<tf>:<símbolos>:<inicio>:<fin>`.
+- Cuotas y fallos: con `X-RateLimit-Remaining: 0` la siguiente petición espera a `X-RateLimit-Reset`; 429 espera `Retry-After` (o el reset, o backoff); 5xx y errores de red, backoff exponencial `1, 2, 4… s` hasta `max_delay` y `max_attempts` (5); otros 4xx fallan sin reintento (`AlpacaRequestError`); agotados los reintentos, `AlpacaUnavailableError`.
+- Sólo librería estándar (`urllib`), transporte HTTP inyectable; tests con un transporte falso, sin red.
+- `AlpacaSessionBarSource`: barras de 1 minuto de `[apertura, cierre)` de la sesión regular según `ExchangeCalendar` (incluidos cierres tempranos).
+- Configuración `intraday` en `local.yaml` (`IntradaySettings`: feed `iex`, reintentos, tolerancia); credenciales `ALPACA_API_KEY_ID` y `ALPACA_API_SECRET_KEY` sólo en `.env` (añadidas a `.env.example`).
+
+Resolución intrabarra (`engine/intrabar.py`, `IntrabarResolver`), sólo para posiciones Long:
+
+1. La vela no toca SL ni TP: sin salida y sin descarga.
+2. Toca sólo uno: ese nivel con las reglas de la v1 (`evaluate_bar_exit`), sin descarga.
+3. Toca ambos y la apertura ya está más allá de un nivel (`OPENING_GAP`): SL a la apertura o TP al nivel, sin descarga.
+4. Toca ambos dentro de la sesión: descarga una vez las barras de 1 minuto de esa sesión y recorre la trayectoria. El primer minuto que toca el SL decide `STOP_LOSS` a `min(apertura del minuto, SL)`; si el primero es el TP, `TAKE_PROFIT` al nivel sólo si el SL aparece más tarde en la trayectoria; un minuto con ambos niveles es SL (`SAME_MINUTE`).
+5. Fallback de la v1 (SL): sin fuente, error de la fuente (cualquier excepción, cacheada por sesión), sesión sin barras, barras fuera del rango diario más allá de la tolerancia del 1 % (escala distinta, p. ej. sin ajustar por un split) o trayectoria que no muestra el orden (con IEX el SL diario puede no aparecer en los minutos).
+
+Cada vela con ambos niveles deja un `IntrabarResolutionRecord` (resolución, salida, minuto del primer toque, error).
+
+Integración:
+
+- `BacktestEngine.run(..., intrabar_resolver=None)`: sin resolver, el paso 3 es el de la v1. `BacktestRunService.run(..., intrabar_resolver=...)`.
+- Informe: `intrabar` (velas en conflicto, TP primero, SL primero, fallbacks, por resolución y registros), ausente del JSON sin resolver; también en `backtest_runs.parameters.intrabar_resolution` (sin los registros).
+- `algo-backtest --intrabar-resolution`: proveedor Alpaca con `adjustment = split` y el calendario; falla si faltan las credenciales o el calendario. Sólo en backtests individuales; informe con la etiqueta `intrabar`.
+- Regresión: sin `--intrabar-resolution` el checksum v1 no cambia (`test_v1_regression.py` en verde).
+
+Aún no hay credenciales de Alpaca en `.env`: el adaptador está verificado sólo con respuestas simuladas, no contra la API real.
+
+Pendiente en el Hito 2: probar con credenciales reales y medir el número de conflictos SL / TP del backtest diversificado y su impacto; persistir las barras de 1 minuto descargadas como snapshots (`market_bars_raw`, timeframe `1m`) para no repetir descargas; resolución intrabarra en walk-forward; correlación de cartera y costes dinámicos.
+
 ## v1 cerrada (2026-10-23)
 
 La v1 (backtesting diario, sin órdenes reales) queda cerrada con estos valores por defecto, definidos en `configs/environments/local.yaml` y usados por `algo-ingest` y `algo-backtest` cuando no se indican argumentos:

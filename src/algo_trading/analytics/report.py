@@ -19,6 +19,8 @@ from algo_trading.backtesting.engine import (
     GapFilteredEntry,
 )
 from algo_trading.domain.corporate_actions.dto import CorporateDividend
+from algo_trading.engine.intrabar import IntrabarResolutionRecord
+from algo_trading.execution.exit_rules import ExitReason
 from algo_trading.execution.trade import Trade
 from algo_trading.portfolio.allocator import RejectedCandidate
 from algo_trading.signals import CompositeSignalGenerator, SignalGenerator
@@ -42,6 +44,25 @@ class SignalFilterSummary(BaseModel):
     filtered_signals: int = Field(ge=0)
     filtered_by: dict[str, int]
     filtered_reasons: dict[str, int]
+
+
+class IntrabarSummary(BaseModel):
+    """
+    Velas con SL y TP tocados y cómo se resolvieron con datos intradía.
+
+    `take_profit_first` son las que la v1 habría cerrado por SL y la
+    trayectoria intradía cerró por TP; `fallbacks`, las resueltas con la
+    política de la v1 por falta de datos o de orden.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    conflicts: int = Field(ge=0)
+    take_profit_first: int = Field(ge=0)
+    stop_loss_first: int = Field(ge=0)
+    fallbacks: int = Field(ge=0)
+    by_resolution: dict[str, int]
+    records: tuple[IntrabarResolutionRecord, ...]
 
 
 class BacktestReport(BaseModel):
@@ -72,6 +93,10 @@ class BacktestReport(BaseModel):
     signal_filters: SignalFilterSummary | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
+    # Igual que `signal_filters`: ausente sin resolución intrabarra.
+    intrabar: IntrabarSummary | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 def build_report(
@@ -100,6 +125,30 @@ def build_report(
         dividends=result.dividends,
         equity_curve=curve,
         signal_filters=summarize_signal_filters(result, signal_generator),
+        intrabar=summarize_intrabar(result),
+    )
+
+
+def summarize_intrabar(result: BacktestResult) -> IntrabarSummary | None:
+    if not result.uses_intrabar_resolution:
+        return None
+
+    records = result.intrabar_resolutions
+    fallbacks = [record for record in records if record.resolution.is_fallback]
+    resolved = [record for record in records if not record.resolution.is_fallback]
+    return IntrabarSummary(
+        conflicts=len(records),
+        take_profit_first=sum(
+            record.exit_reason is ExitReason.TAKE_PROFIT for record in resolved
+        ),
+        stop_loss_first=sum(
+            record.exit_reason is ExitReason.STOP_LOSS for record in resolved
+        ),
+        fallbacks=len(fallbacks),
+        by_resolution=dict(
+            sorted(Counter(str(record.resolution) for record in records).items())
+        ),
+        records=records,
     )
 
 
@@ -144,6 +193,28 @@ def summarize_signal_filters(
 
 def report_to_json(report: BacktestReport) -> str:
     return report.model_dump_json(indent=2)
+
+
+def _intrabar_lines(summary: IntrabarSummary | None) -> list[str]:
+    if summary is None:
+        return []
+
+    return [
+        "## Resolución intrabarra SL / TP (v2)",
+        "",
+        f"- Velas con SL y TP tocados: {summary.conflicts}",
+        f"- Resueltas por la trayectoria intradía: TP primero "
+        f"{summary.take_profit_first}, SL primero {summary.stop_loss_first}",
+        f"- Fallback a la política v1 (SL): {summary.fallbacks}",
+        "- Por resolución: "
+        + (
+            ", ".join(
+                f"{name} {count}" for name, count in summary.by_resolution.items()
+            )
+            or NOT_AVAILABLE
+        ),
+        "",
+    ]
 
 
 def _signal_filter_lines(summary: SignalFilterSummary | None) -> list[str]:
@@ -262,6 +333,7 @@ def report_to_markdown(report: BacktestReport) -> str:
         ),
         "",
         *_signal_filter_lines(report.signal_filters),
+        *_intrabar_lines(report.intrabar),
         "## Registro de trades",
         "",
     ]

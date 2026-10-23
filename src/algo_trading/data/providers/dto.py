@@ -14,6 +14,8 @@ from algo_trading.domain.corporate_actions.dto import (
 class Timeframe(StrEnum):
     DAILY = "1d"
     INTRADAY = "intraday"
+    ONE_MINUTE = "1m"
+    FIVE_MINUTES = "5m"
 
 
 class DataRequest(BaseModel):

@@ -3,7 +3,7 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -114,6 +114,24 @@ class SignalSettings(BaseModel):
     sector_map: dict[str, str] = Field(default_factory=dict)
 
 
+class IntradaySettings(BaseModel):
+    """
+    Proveedor intradía (Hito 2): Alpaca Market Data v2.
+
+    Las credenciales no van aquí: `ALPACA_API_KEY_ID` y
+    `ALPACA_API_SECRET_KEY` se leen del entorno o de `.env`.
+    """
+
+    provider: Literal["alpaca"] = "alpaca"
+    feed: Literal["iex", "sip"] = "iex"
+    data_url: str = "https://data.alpaca.markets"
+    timeout_seconds: float = Field(default=30.0, gt=0)
+    max_attempts: int = Field(default=5, ge=1)
+    base_delay_seconds: float = Field(default=1.0, ge=0)
+    max_delay_seconds: float = Field(default=60.0, ge=0)
+    price_tolerance: Decimal = Field(default=Decimal("0.01"), ge=0)
+
+
 class DatabaseSettings(BaseModel):
     host: str
     port: int = Field(gt=0, le=65535)
@@ -150,6 +168,7 @@ class ApplicationSettings(BaseSettings):
     default_universe: str = DEFAULT_UNIVERSE
     strategy: StrategySettings = Field(default_factory=StrategySettings)
     signals: SignalSettings = Field(default_factory=SignalSettings)
+    intraday: IntradaySettings = Field(default_factory=IntradaySettings)
 
     @model_validator(mode="after")
     def validate_default_universe(self) -> "ApplicationSettings":
@@ -163,6 +182,8 @@ class ApplicationSettings(BaseSettings):
         return self
 
     database_password: str | None = None
+    alpaca_api_key_id: str | None = None
+    alpaca_api_secret_key: SecretStr | None = None
 
     @classmethod
     def from_yaml(

@@ -75,6 +75,18 @@ universes:
     - XLB
     - XLRE
 
+# Proveedor intradía v2 (Hito 2). Credenciales en .env: ALPACA_API_KEY_ID y
+# ALPACA_API_SECRET_KEY. Se usa con algo-backtest --intrabar-resolution.
+intraday:
+  provider: alpaca
+  feed: iex                  # iex (gratuito, volumen parcial) o sip
+  data_url: https://data.alpaca.markets
+  timeout_seconds: 30
+  max_attempts: 5            # reintentos con backoff exponencial
+  base_delay_seconds: 1
+  max_delay_seconds: 60
+  price_tolerance: 0.01      # margen sobre el rango diario antes del fallback
+
 # Filtros de régimen v2 (desactivados por defecto; se activan desde la CLI con
 # --use-sector-relative-strength y --vix-filter-threshold).
 signals:

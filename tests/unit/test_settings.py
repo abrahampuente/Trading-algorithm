@@ -1,8 +1,10 @@
 from decimal import Decimal
 
 import pytest
+import yaml
 
 from algo_trading.config.settings import (
+    LOCAL_CONFIG_PATH,
     ApplicationSettings,
     default_cost_profiles,
     default_universes,
@@ -100,3 +102,17 @@ def test_local_settings_define_macro_benchmarks_and_signal_filters() -> None:
     )
     assert set(signals.sector_map.values()) <= set(signals.sector_etfs)
     assert set(signals.sector_map) <= set(settings.universe("diversified"))
+
+
+def test_local_settings_define_intraday_provider_without_secrets() -> None:
+    settings = ApplicationSettings.from_yaml()
+    intraday = settings.intraday
+
+    assert intraday.provider == "alpaca"
+    assert intraday.feed == "iex"
+    assert intraday.data_url == "https://data.alpaca.markets"
+    assert intraday.max_attempts == 5
+    assert intraday.price_tolerance == Decimal("0.01")
+    assert "alpaca_api_secret_key" not in yaml.safe_load(
+        LOCAL_CONFIG_PATH.read_text(encoding="utf-8")
+    )
