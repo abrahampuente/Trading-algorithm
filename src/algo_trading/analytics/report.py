@@ -1,8 +1,10 @@
+from collections import Counter
 from collections.abc import Mapping, Sequence
 from decimal import ROUND_HALF_EVEN, Decimal
 from pathlib import Path
+from typing import Any
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from algo_trading.analytics.metrics import (
     PerformanceMetrics,
@@ -19,9 +21,27 @@ from algo_trading.backtesting.engine import (
 from algo_trading.domain.corporate_actions.dto import CorporateDividend
 from algo_trading.execution.trade import Trade
 from algo_trading.portfolio.allocator import RejectedCandidate
+from algo_trading.signals import CompositeSignalGenerator, SignalGenerator
 
 REPORT_VERSION = "backtest-report-v2"
 NOT_AVAILABLE = "n/d"
+
+
+class SignalFilterSummary(BaseModel):
+    """
+    Generador multi-factor usado en el backtest y señales que bloqueó.
+
+    `filtered_by` cuenta, por filtro, las señales que no superó;
+    `filtered_reasons` cuenta los motivos por falta de datos.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    strategy_id: str
+    filters: tuple[dict[str, Any], ...]
+    filtered_signals: int = Field(ge=0)
+    filtered_by: dict[str, int]
+    filtered_reasons: dict[str, int]
 
 
 class BacktestReport(BaseModel):
@@ -47,6 +67,11 @@ class BacktestReport(BaseModel):
     rejected: tuple[RejectedCandidate, ...]
     dividends: tuple[DividendPayment, ...] = ()
     equity_curve: tuple[EquityPoint, ...]
+    # Ausente del JSON sin generador multi-factor: el informe (y su checksum)
+    # de la v1 no cambia.
+    signal_filters: SignalFilterSummary | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 def build_report(
@@ -54,6 +79,7 @@ def build_report(
     bars_by_symbol: Mapping[str, Sequence[ExecutionBar]],
     dividends_by_symbol: Mapping[str, Sequence[CorporateDividend]] | None = None,
     trading_calendar: str | None = None,
+    signal_generator: SignalGenerator | None = None,
 ) -> BacktestReport:
     curve = result.equity_curve
 
@@ -73,11 +99,79 @@ def build_report(
         rejected=result.rejected,
         dividends=result.dividends,
         equity_curve=curve,
+        signal_filters=summarize_signal_filters(result, signal_generator),
+    )
+
+
+def summarize_signal_filters(
+    result: BacktestResult,
+    signal_generator: SignalGenerator | None,
+) -> SignalFilterSummary | None:
+    if result.signal_strategy_id is None:
+        return None
+
+    filters = (
+        signal_generator.filters
+        if isinstance(signal_generator, CompositeSignalGenerator)
+        else ()
+    )
+    failed = [
+        filter_result
+        for filtered in result.filtered_signals
+        for filter_result in filtered.results
+        if not filter_result.passed
+    ]
+    return SignalFilterSummary(
+        strategy_id=result.signal_strategy_id,
+        filters=tuple(
+            {
+                "name": signal_filter.name,
+                **(
+                    signal_filter.model_dump(mode="json")
+                    if isinstance(signal_filter, BaseModel)
+                    else {}
+                ),
+            }
+            for signal_filter in filters
+        ),
+        filtered_signals=len(result.filtered_signals),
+        filtered_by=dict(sorted(Counter(item.name for item in failed).items())),
+        filtered_reasons=dict(
+            sorted(Counter(item.reason for item in failed if item.reason).items())
+        ),
     )
 
 
 def report_to_json(report: BacktestReport) -> str:
     return report.model_dump_json(indent=2)
+
+
+def _signal_filter_lines(summary: SignalFilterSummary | None) -> list[str]:
+    if summary is None:
+        return []
+
+    filters = ", ".join(str(item["name"]) for item in summary.filters)
+    return [
+        "## Filtros de señal (v2)",
+        "",
+        f"- Estrategia: `{summary.strategy_id}`",
+        f"- Filtros: {filters or NOT_AVAILABLE}",
+        f"- Señales bloqueadas: {summary.filtered_signals}",
+        "- Bloqueos por filtro: "
+        + (
+            ", ".join(f"{name} {count}" for name, count in summary.filtered_by.items())
+            or NOT_AVAILABLE
+        ),
+        "- Motivos por falta de datos: "
+        + (
+            ", ".join(
+                f"{reason} {count}"
+                for reason, count in summary.filtered_reasons.items()
+            )
+            or NOT_AVAILABLE
+        ),
+        "",
+    ]
 
 
 def report_to_markdown(report: BacktestReport) -> str:
@@ -167,6 +261,7 @@ def report_to_markdown(report: BacktestReport) -> str:
             or NOT_AVAILABLE
         ),
         "",
+        *_signal_filter_lines(report.signal_filters),
         "## Registro de trades",
         "",
     ]

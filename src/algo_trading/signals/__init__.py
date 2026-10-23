@@ -18,6 +18,7 @@ from algo_trading.signals.filters import (
 from algo_trading.signals.momentum_breakout import (
     MOMENTUM_BREAKOUT_V1,
     MomentumBreakoutGenerator,
+    long_signal_from_signal,
     signal_from_long_signal,
 )
 
@@ -39,6 +40,7 @@ __all__ = [
     "SignalGenerator",
     "VixRegimeFilter",
     "VolatilityRegimeFilter",
+    "long_signal_from_signal",
     "percentile_rank",
     "relative_strength",
     "signal_from_long_signal",

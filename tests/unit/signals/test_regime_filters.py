@@ -185,6 +185,22 @@ def test_sector_rotation_rejects_unmapped_symbol_and_stale_etf() -> None:
     assert (stale.passed, stale.reason) == (False, MISSING_REFERENCE_DATA)
 
 
+def test_sector_rotation_can_let_unmapped_symbols_through() -> None:
+    bars = build_bars("GLD", linear(50, "1", 30))
+    sector_filter = SectorRotationFilter(
+        sector_map=SECTOR_MAP,
+        sector_etfs=SECTOR_ETFS,
+        lookback=20,
+        top_k=1,
+        allow_unmapped=True,
+    )
+
+    result = sector_filter.evaluate(signal_at(bars), bars, sector_context(30))
+
+    assert (result.passed, result.reason) == (True, UNMAPPED_SECTOR)
+    assert result.values == {}
+
+
 def test_sector_rotation_requires_etf_for_every_sector() -> None:
     with pytest.raises(ValueError, match="utilities"):
         SectorRotationFilter(

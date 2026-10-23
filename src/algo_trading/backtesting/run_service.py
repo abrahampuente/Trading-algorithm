@@ -26,6 +26,7 @@ from algo_trading.persistence.repositories.corporate_action_query_repository imp
     CorporateActionQueryRepository,
 )
 from algo_trading.portfolio.position_sizing import MONEY_PRECISION, MONEY_ROUNDING
+from algo_trading.signals import SignalContext, SignalGenerator
 
 
 class MissingMarketDataError(ValueError):
@@ -36,7 +37,10 @@ class BacktestRunRequest(BaseModel):
     """
     Qué datos ajustados leer de MySQL y con qué parámetros simular.
 
-    `start` y `end` son fechas de sesión inclusivas.
+    `start` y `end` son fechas de sesión inclusivas. `reference_symbols` son
+    series no operables (benchmarks, VIX, ETFs sectoriales) que se cargan
+    para el `SignalContext` de los filtros v2; no entran en la cartera ni en
+    el Buy & Hold.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -49,6 +53,7 @@ class BacktestRunRequest(BaseModel):
     timeframe: str = Field(default="1d", min_length=1, max_length=16)
     adjustment_version: str = Field(default="splits-v1", min_length=1, max_length=64)
     include_dividends: bool = True
+    reference_symbols: tuple[str, ...] = ()
 
     @model_validator(mode="after")
     def validate_request(self) -> Self:
@@ -77,6 +82,7 @@ class PreparedMarketData(BaseModel):
     bars_by_symbol: dict[str, tuple[MarketBar, ...]]
     dividends_by_symbol: dict[str, tuple[CorporateDividend, ...]]
     trading_sessions: tuple[date, ...] | None
+    reference_bars: dict[str, tuple[MarketBar, ...]] = Field(default_factory=dict)
 
 
 class BacktestRunService:
@@ -176,7 +182,7 @@ class BacktestRunService:
         return dividends_by_symbol
 
     def prepare(self, request: BacktestRunRequest) -> PreparedMarketData:
-        """Lee barras, dividendos y sesiones del periodo solicitado."""
+        """Lee barras, dividendos, sesiones y series de referencia del periodo."""
         return PreparedMarketData(
             bars_by_symbol=self.load_bars(request),
             dividends_by_symbol=(
@@ -192,6 +198,13 @@ class BacktestRunService:
                 if self._calendar is not None
                 else None
             ),
+            reference_bars=(
+                self.load_bars(
+                    request.model_copy(update={"symbols": request.reference_symbols})
+                )
+                if request.reference_symbols
+                else {}
+            ),
         )
 
     def run(
@@ -199,12 +212,14 @@ class BacktestRunService:
         request: BacktestRunRequest,
         persist: bool = True,
         sweep_id: str | None = None,
+        signal_generator: SignalGenerator | None = None,
     ) -> BacktestRunOutcome:
         return self.run_prepared(
             request,
             self.prepare(request),
             persist=persist,
             sweep_id=sweep_id,
+            signal_generator=signal_generator,
         )
 
     def run_prepared(
@@ -213,22 +228,32 @@ class BacktestRunService:
         data: PreparedMarketData,
         persist: bool = True,
         sweep_id: str | None = None,
+        signal_generator: SignalGenerator | None = None,
     ) -> BacktestRunOutcome:
         """
         Ejecuta el backtest con datos ya preparados.
 
         Permite variar `request.parameters` sin volver a leer MySQL (barridos).
+        Con `signal_generator`, las señales salen de ese generador con las
+        series de referencia preparadas como contexto; sin él, es la v1.
         """
         result = BacktestEngine(request.parameters).run(
             data.bars_by_symbol,
             trading_sessions=data.trading_sessions,
             dividends_by_symbol=data.dividends_by_symbol,
+            signal_generator=signal_generator,
+            signal_context=(
+                SignalContext(data.reference_bars)
+                if signal_generator is not None
+                else None
+            ),
         )
         report = build_report(
             result,
             data.bars_by_symbol,
             dividends_by_symbol=data.dividends_by_symbol,
             trading_calendar=self._calendar.name if self._calendar else None,
+            signal_generator=signal_generator,
         )
         checksum = hashlib.sha256(report_to_json(report).encode("utf-8")).hexdigest()
 

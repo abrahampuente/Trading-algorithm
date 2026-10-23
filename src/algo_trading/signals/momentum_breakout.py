@@ -34,6 +34,40 @@ def signal_from_long_signal(
     )
 
 
+V1_BAND_FACTORS = ("upper_band", "previous_close", "previous_upper_band")
+
+
+def long_signal_from_signal(signal: Signal) -> LongSignal:
+    """
+    Traduce una `Signal` Long con los factores de banda de la v1 a
+    `LongSignal`, el contrato que usa hoy el motor de backtest.
+
+    `momentum` toma el `score` de la señal, que es el criterio de prioridad
+    del allocator. Falla con señales Short o sin los factores de la v1.
+    """
+    if signal.side is not Side.LONG:
+        raise ValueError(f"El motor v1 sólo admite señales LONG: {signal.side}")
+
+    missing = [name for name in V1_BAND_FACTORS if name not in signal.factors]
+
+    if missing:
+        raise ValueError(
+            f"La señal de {signal.symbol} no tiene los factores v1: "
+            + ", ".join(missing)
+        )
+
+    return LongSignal(
+        symbol=signal.symbol,
+        signal_timestamp=signal.signal_timestamp,
+        close=signal.close,
+        upper_band=signal.factors["upper_band"],
+        previous_close=signal.factors["previous_close"],
+        previous_upper_band=signal.factors["previous_upper_band"],
+        atr=signal.atr,
+        momentum=signal.score,
+    )
+
+
 class MomentumBreakoutGenerator:
     """
     Estrategia v1 (momentum + ruptura de Bollinger) como `SignalGenerator`.

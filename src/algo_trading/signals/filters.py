@@ -100,6 +100,9 @@ class SectorRotationFilter(BaseModel):
     En `t` ordena los sectores por la fuerza relativa de su ETF frente al
     benchmark (`lookback` sesiones; empate por nombre del sector) y exige que
     el sector del símbolo esté entre los `top_k` primeros.
+
+    Con `allow_unmapped`, los símbolos sin sector (índices amplios, oro,
+    bonos) pasan sin evaluarse y quedan marcados con `unmapped_sector`.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -109,6 +112,7 @@ class SectorRotationFilter(BaseModel):
     sector_etfs: dict[str, str] = Field(min_length=1)
     lookback: int = Field(default=63, ge=1)
     top_k: int = Field(default=4, ge=1)
+    allow_unmapped: bool = False
 
     @model_validator(mode="after")
     def validate_sectors(self) -> Self:
@@ -132,7 +136,9 @@ class SectorRotationFilter(BaseModel):
         sector = self.sector_map.get(signal.symbol)
 
         if sector is None:
-            return FilterResult(name=self.name, passed=False, reason=UNMAPPED_SECTOR)
+            return FilterResult(
+                name=self.name, passed=self.allow_unmapped, reason=UNMAPPED_SECTOR
+            )
 
         strengths: dict[str, Decimal] = {}
 

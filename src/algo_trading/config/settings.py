@@ -76,7 +76,42 @@ def default_universes() -> dict[str, tuple[str, ...]]:
             "XLF",
             "XLV",
         ),
+        "macro_benchmarks": (
+            "SPY",
+            "QQQ",
+            "^VIX",
+            "XLK",
+            "XLF",
+            "XLV",
+            "XLE",
+            "XLY",
+            "XLP",
+            "XLI",
+            "XLC",
+            "XLU",
+            "XLB",
+            "XLRE",
+        ),
     }
+
+
+class SignalSettings(BaseModel):
+    """
+    Configuración de los filtros de régimen de la v2 (`signals/`).
+
+    Sólo se usa cuando la CLI activa un filtro; sin filtros, el backtest es el
+    de la v1. `reference_universe` son las series de referencia que se cargan
+    en el `SignalContext` (benchmarks, VIX y ETFs sectoriales).
+    """
+
+    reference_universe: str = "macro_benchmarks"
+    benchmark: str = "SPY"
+    vix_symbol: str = "^VIX"
+    relative_strength_lookback: int = Field(default=63, ge=1)
+    sector_top_k: int = Field(default=4, ge=1)
+    sector_allow_unmapped: bool = True
+    sector_etfs: dict[str, str] = Field(default_factory=dict)
+    sector_map: dict[str, str] = Field(default_factory=dict)
 
 
 class DatabaseSettings(BaseModel):
@@ -114,6 +149,7 @@ class ApplicationSettings(BaseSettings):
     )
     default_universe: str = DEFAULT_UNIVERSE
     strategy: StrategySettings = Field(default_factory=StrategySettings)
+    signals: SignalSettings = Field(default_factory=SignalSettings)
 
     @model_validator(mode="after")
     def validate_default_universe(self) -> "ApplicationSettings":

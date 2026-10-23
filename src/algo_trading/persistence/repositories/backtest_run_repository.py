@@ -95,7 +95,7 @@ class BacktestRunRepository:
             source=metadata.source,
             adjustment_version=metadata.adjustment_version,
             trading_calendar=report.trading_calendar,
-            parameters=report.parameters.model_dump(mode="json"),
+            parameters=_run_parameters(report),
             initial_cash=_money(metrics.initial_equity),
             final_equity=_money(metrics.final_equity),
             net_profit=_money(metrics.net_profit),
@@ -247,6 +247,16 @@ def _naive_utc(value: datetime) -> datetime:
         return value
 
     return value.astimezone(UTC).replace(tzinfo=None)
+
+
+def _run_parameters(report: BacktestReport) -> dict[str, Any]:
+    """Parámetros del backtest; con filtros v2 añade `signal_filters`."""
+    parameters = report.parameters.model_dump(mode="json")
+
+    if report.signal_filters is not None:
+        parameters["signal_filters"] = report.signal_filters.model_dump(mode="json")
+
+    return parameters
 
 
 def _money(value: Decimal) -> Decimal:

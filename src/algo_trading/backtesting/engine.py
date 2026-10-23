@@ -32,6 +32,13 @@ from algo_trading.portfolio.position_sizing import (
     PositionSizer,
     RiskParameters,
 )
+from algo_trading.signals import (
+    CompositeSignalGenerator,
+    FilteredSignal,
+    SignalContext,
+    SignalGenerator,
+    long_signal_from_signal,
+)
 from algo_trading.strategy.long_signal import (
     LongSignal,
     LongSignalGenerator,
@@ -116,6 +123,8 @@ class BacktestResult(BaseModel):
     final_cash: Decimal
     dividends: tuple[DividendPayment, ...] = ()
     uses_trading_calendar: bool = False
+    signal_strategy_id: str | None = None
+    filtered_signals: tuple[FilteredSignal, ...] = ()
 
 
 class BacktestEngine:
@@ -161,6 +170,13 @@ class BacktestEngine:
     las señales son invariantes a barras futuras, las de una serie más larga
     coinciden con las de cualquier prefijo y aquí sólo se usan las de barras
     presentes.
+
+    `signal_generator` sustituye a `LongSignalGenerator` por un generador
+    multi-factor (p. ej. `CompositeSignalGenerator` con filtros de régimen),
+    que recibe `signal_context` con las series de referencia. Sus señales
+    deben ser Long con los factores de banda de la v1 (`long_signal_from_signal`);
+    las bloqueadas por filtros quedan en `BacktestResult.filtered_signals`. Sin
+    generador, el motor es exactamente el de la v1.
     """
 
     def __init__(self, parameters: BacktestParameters) -> None:
@@ -175,7 +191,12 @@ class BacktestEngine:
         dividends_by_symbol: Mapping[str, Sequence[CorporateDividend]] | None = None,
         trading_start: date | None = None,
         precomputed_signals: Mapping[str, Sequence[LongSignal]] | None = None,
+        signal_generator: SignalGenerator | None = None,
+        signal_context: SignalContext | None = None,
     ) -> BacktestResult:
+        if precomputed_signals is not None and signal_generator is not None:
+            raise ValueError("precomputed_signals y signal_generator son excluyentes")
+
         parameters = self._parameters
         costs = parameters.costs
         series = self._validate_series(bars_by_symbol)
@@ -192,14 +213,30 @@ class BacktestEngine:
             symbol: {bar.timestamp: index for index, bar in enumerate(bars)}
             for symbol, bars in series.items()
         }
+        filtered_signals: list[FilteredSignal] = []
+
+        def long_signals(
+            symbol: str, bars: Sequence[ExecutionBar]
+        ) -> Sequence[LongSignal]:
+            if precomputed_signals is not None:
+                return precomputed_signals.get(symbol, ())
+
+            if signal_generator is None:
+                return self._signal_generator.generate(bars)
+
+            if isinstance(signal_generator, CompositeSignalGenerator):
+                outcome = signal_generator.run(bars, signal_context)
+                filtered_signals.extend(outcome.filtered)
+                accepted = outcome.accepted
+            else:
+                accepted = signal_generator.generate(bars, signal_context)
+
+            return tuple(long_signal_from_signal(signal) for signal in accepted)
+
         signals_by_symbol = {
             symbol: {
                 index_by_symbol[symbol][signal.signal_timestamp]: signal
-                for signal in (
-                    self._signal_generator.generate(bars)
-                    if precomputed_signals is None
-                    else precomputed_signals.get(symbol, ())
-                )
+                for signal in long_signals(symbol, bars)
                 if signal.signal_timestamp in index_by_symbol[symbol]
             }
             for symbol, bars in series.items()
@@ -440,6 +477,10 @@ class BacktestEngine:
             final_cash=cash,
             dividends=tuple(dividend_payments),
             uses_trading_calendar=calendar_index is not None,
+            signal_strategy_id=(
+                signal_generator.strategy_id if signal_generator is not None else None
+            ),
+            filtered_signals=tuple(filtered_signals),
         )
 
     @staticmethod

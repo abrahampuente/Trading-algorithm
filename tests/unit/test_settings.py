@@ -5,6 +5,7 @@ import pytest
 from algo_trading.config.settings import (
     ApplicationSettings,
     default_cost_profiles,
+    default_universes,
 )
 
 
@@ -81,3 +82,21 @@ def test_default_universe_must_exist() -> None:
         ApplicationSettings.model_validate(
             {**settings.model_dump(), "default_universe": "global"}
         )
+
+
+def test_local_settings_define_macro_benchmarks_and_signal_filters() -> None:
+    settings = ApplicationSettings.from_yaml()
+    signals = settings.signals
+
+    assert (
+        settings.universe("macro_benchmarks") == default_universes()["macro_benchmarks"]
+    )
+    assert "^VIX" in settings.universe(signals.reference_universe)
+    assert signals.benchmark == "SPY"
+    assert signals.vix_symbol == "^VIX"
+    assert len(signals.sector_etfs) == 11
+    assert set(signals.sector_etfs.values()) <= set(
+        settings.universe(signals.reference_universe)
+    )
+    assert set(signals.sector_map.values()) <= set(signals.sector_etfs)
+    assert set(signals.sector_map) <= set(settings.universe("diversified"))

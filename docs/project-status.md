@@ -32,7 +32,34 @@ Paquete `signals/` (no lo usa todavía el motor de backtest; `strategy/` e `indi
 - Filtros: `RelativeStrengthFilter` (RS frente a SPY/QQQ en `n` sesiones), `SectorRotationFilter` (ranking de ETFs sectoriales por RS, `top_k`), `VolatilityRegimeFilter` (percentil de `ATR / Close`), `VixRegimeFilter` y `BenchmarkTrendFilter` (benchmark sobre su SMA). Si faltan datos rechazan con motivo (`insufficient_history`, `missing_reference_data`, `unmapped_sector`).
 - Tests: equivalencia con la v1, invariancia a barras futuras (símbolo y referencias) y detección de un filtro con fuga de datos.
 
-Pendiente en el Hito 1: ingesta de benchmarks, ETFs sectoriales y `^VIX`; confirmación por volumen; Short y reversión a la media; integración en el motor y walk-forward frente al baseline v1.
+Series de referencia (universo `macro_benchmarks` en `local.yaml`): `SPY QQQ ^VIX XLK XLF XLV XLE XLY XLP XLI XLC XLU XLB XLRE`, ingeridas con `algo-ingest --universe macro_benchmarks` (2026-10-23): 1711 sesiones por ETF y 1713 del `^VIX` (2020-01-02 → 2026-10-22; el VIX publica dos días sin sesión NYSE, irrelevante porque los filtros buscan el timestamp exacto). Splits SPDR de diciembre de 2025 en XLK, XLB, XLU y XLY.
+
+Cableado al motor y a la CLI:
+
+- `BacktestEngine.run(..., signal_generator=None, signal_context=None)`: con generador, las señales salen de él (con `CompositeSignalGenerator`, las bloqueadas quedan en `BacktestResult.filtered_signals`); excluyente con `precomputed_signals`. Mientras el motor siga trabajando con `LongSignal`, las señales deben ser Long con los factores de banda v1 (`long_signal_from_signal`; `momentum = score`).
+- `BacktestRunRequest.reference_symbols` carga las series de referencia en `PreparedMarketData.reference_bars`; `BacktestRunService.run(..., signal_generator=...)` construye el `SignalContext`.
+- Informe: `signal_filters` (estrategia, configuración de cada filtro, señales bloqueadas por filtro y motivos por falta de datos). Sin generador el campo no aparece en el JSON, así que el informe y el checksum v1 no cambian; con generador también se guarda en `backtest_runs.parameters.signal_filters` (sin migración).
+- Configuración `signals` en `local.yaml` (`SignalSettings`): universo de referencia, benchmark SPY, `^VIX`, `relative_strength_lookback = 63`, `sector_top_k = 4`, los 11 ETFs sectoriales y el sector de cada símbolo de `diversified`. SPY, GLD y TLT no tienen sector y pasan el filtro sectorial (`sector_allow_unmapped`).
+- `algo-backtest --use-sector-relative-strength` (rotación sectorial: el ETF del sector del símbolo debe estar entre los 4 de mayor RS frente a SPY a 63 sesiones) y `--vix-filter-threshold X` (cierre del VIX en `t` <= X). Sólo en backtests individuales; el nombre del informe lleva la etiqueta del filtro (`backtest_sector-rs_vix25_diversified_…`).
+
+Comparación (diversified, valores v1, 2020-01-01 → 2026-10-22, perfil base, persistidas):
+
+```text
+Variante              Run        Retorno   MDD      PF    Trades  Win Rate  Exp. R  Exposición  Bloqueadas
+v1 (sin filtros)      f0b61229   26.29 %   8.13 %   1.21  332     47.59 %   0.091   40.7 %      -
+sector RS             2a9940cc   25.56 %   9.43 %   1.31  245     47.76 %   0.105   30.4 %      158
+VIX <= 25             0e2b2ce8   15.78 %  10.07 %   1.15  298     46.64 %   0.077   36.8 %       70
+VIX <= 20             bee3c7b9    3.57 %  13.09 %   1.05  230     45.65 %   0.037   28.1 %      176
+sector RS + VIX <= 25 5e0654d7   14.97 %   9.74 %   1.21  221     46.15 %   0.083   27.4 %      207
+Buy & Hold diversificado: 184.19 % (MDD 28.41 %)
+```
+
+- La ejecución sin filtros reproduce el checksum de la referencia v1 (`1e500e90…eed5c`).
+- El filtro sectorial mejora la calidad por trade (PF 1,21 → 1,31, expectancy 0,091 → 0,105 R) con un retorno casi igual y menos exposición, pero empeora el MDD (8,1 % → 9,4 %). Bloquea 158 señales (5 por historial insuficiente al inicio de 2020).
+- El filtro VIX empeora todo: las rupturas con VIX alto (rebotes tras correcciones) son de las mejores señales de la estrategia. Cuanto más estricto, peor.
+- Es una comparación dentro de la muestra con parámetros de filtro no optimizados; antes de adoptar el filtro sectorial hay que validarlo con walk-forward (falta añadir los filtros a la rejilla).
+
+Pendiente en el Hito 1: filtros en la rejilla de barrido y walk-forward; confirmación por volumen; Short y reversión a la media (requieren generalizar `EntryCandidate` más allá de `LongSignal`).
 
 ## v1 cerrada (2026-10-23)
 

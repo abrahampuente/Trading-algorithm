@@ -64,6 +64,10 @@ class CompositeSignalGenerator:
     def strategy_id(self) -> str:
         return self._strategy_id
 
+    @property
+    def filters(self) -> tuple[SignalFilter, ...]:
+        return self._filters
+
     def generate(
         self,
         bars: Sequence[PriceBar],

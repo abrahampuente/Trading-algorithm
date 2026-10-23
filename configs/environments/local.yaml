@@ -57,3 +57,55 @@ universes:
     - XLE
     - XLF
     - XLV
+  # Series de referencia de la v2 (no operables): benchmarks, VIX y los 11
+  # ETFs sectoriales SPDR. Alimentan los filtros de régimen de signals/.
+  macro_benchmarks:
+    - SPY
+    - QQQ
+    - "^VIX"
+    - XLK
+    - XLF
+    - XLV
+    - XLE
+    - XLY
+    - XLP
+    - XLI
+    - XLC
+    - XLU
+    - XLB
+    - XLRE
+
+# Filtros de régimen v2 (desactivados por defecto; se activan desde la CLI con
+# --use-sector-relative-strength y --vix-filter-threshold).
+signals:
+  reference_universe: macro_benchmarks
+  benchmark: SPY
+  vix_symbol: "^VIX"
+  relative_strength_lookback: 63   # sesiones (≈3 meses)
+  sector_top_k: 4                  # sectores más fuertes admitidos
+  sector_allow_unmapped: true      # SPY, GLD, TLT no son apuestas sectoriales
+  sector_etfs:
+    technology: XLK
+    financials: XLF
+    health_care: XLV
+    energy: XLE
+    consumer_discretionary: XLY
+    consumer_staples: XLP
+    industrials: XLI
+    communication_services: XLC
+    utilities: XLU
+    materials: XLB
+    real_estate: XLRE
+  sector_map:
+    AAPL: technology
+    MSFT: technology
+    GOOGL: communication_services
+    QQQ: technology
+    XOM: energy
+    JPM: financials
+    JNJ: health_care
+    PG: consumer_staples
+    CAT: industrials
+    XLE: energy
+    XLF: financials
+    XLV: health_care

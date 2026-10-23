@@ -13,6 +13,7 @@ Uso:
     algo-backtest --walk-forward --universe diversified --positions-grid 5 8 10 \
         --risk-grid 0.005 0.01 0.015 --report-tag portfolio_scaling
     algo-backtest --list-runs 10
+    algo-backtest --use-sector-relative-strength --vix-filter-threshold 25
 
 Lee `market_bars_adjusted` y los dividendos, valida las series contra el
 calendario de mercado, ejecuta la estrategia v1, guarda la ejecución en
@@ -27,6 +28,11 @@ Con `--walk-forward` optimiza la misma rejilla en ventanas In-Sample
 rodantes, aplica la combinación elegida a la ventana Out-of-Sample siguiente
 y escribe `reports/walk_forward_*.md` con la curva OOS encadenada y la
 Eficiencia Walk-Forward (WFE).
+
+Con `--use-sector-relative-strength` y/o `--vix-filter-threshold`, las
+señales v1 pasan por los filtros de régimen v2 (`signals/`) con las series de
+referencia de `signals.reference_universe`. Sin esas opciones, el backtest es
+exactamente el de la v1.
 """
 
 import argparse
@@ -80,6 +86,14 @@ from algo_trading.persistence.repositories.backtest_run_repository import (
     BacktestRunSummary,
 )
 from algo_trading.portfolio.position_sizing import RiskParameters
+from algo_trading.signals import (
+    MOMENTUM_BREAKOUT_V1,
+    CompositeSignalGenerator,
+    MomentumBreakoutGenerator,
+    SectorRotationFilter,
+    SignalFilter,
+    VixRegimeFilter,
+)
 
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "reports"
 NO_CALENDAR = "none"
@@ -256,13 +270,94 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Con --list-runs, muestra sólo las ejecuciones de ese barrido.",
     )
+    parser.add_argument(
+        "--use-sector-relative-strength",
+        action="store_true",
+        help="Filtro v2: sólo señales de los sectores con mayor fuerza relativa "
+        "frente al benchmark (configuración signals).",
+    )
+    parser.add_argument(
+        "--vix-filter-threshold",
+        type=Decimal,
+        default=None,
+        help="Filtro v2: sólo señales con cierre del VIX <= umbral (p. ej. 25).",
+    )
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument(
         "--name",
         default=None,
         help="Nombre base de los ficheros (por defecto: símbolos y periodo).",
     )
-    return parser.parse_args(argv)
+    arguments = parser.parse_args(argv)
+
+    if uses_signal_filters(arguments) and (arguments.sweep or arguments.walk_forward):
+        parser.error(
+            "Los filtros de régimen v2 sólo están disponibles en un backtest "
+            "individual (sin --sweep ni --walk-forward)"
+        )
+
+    return arguments
+
+
+def uses_signal_filters(arguments: argparse.Namespace) -> bool:
+    return bool(
+        arguments.use_sector_relative_strength
+        or arguments.vix_filter_threshold is not None
+    )
+
+
+def build_signal_generator(
+    arguments: argparse.Namespace,
+    settings: ApplicationSettings,
+) -> CompositeSignalGenerator | None:
+    """Señal v1 con los filtros de régimen pedidos, o None sin filtros (v1)."""
+    signals = settings.signals
+    filters: list[SignalFilter] = []
+    labels: list[str] = []
+
+    if arguments.use_sector_relative_strength:
+        filters.append(
+            SectorRotationFilter(
+                benchmark=signals.benchmark,
+                sector_map=signals.sector_map,
+                sector_etfs=signals.sector_etfs,
+                lookback=signals.relative_strength_lookback,
+                top_k=signals.sector_top_k,
+                allow_unmapped=signals.sector_allow_unmapped,
+            )
+        )
+        labels.append("sector_rs")
+
+    if arguments.vix_filter_threshold is not None:
+        filters.append(
+            VixRegimeFilter(
+                symbol=signals.vix_symbol,
+                max_level=arguments.vix_filter_threshold,
+            )
+        )
+        labels.append("vix")
+
+    if not filters:
+        return None
+
+    return CompositeSignalGenerator(
+        MomentumBreakoutGenerator(),
+        filters=filters,
+        strategy_id="+".join([MOMENTUM_BREAKOUT_V1, *labels]),
+    )
+
+
+def signal_filter_tag(arguments: argparse.Namespace) -> str | None:
+    """Etiqueta de informe para los filtros activos (p. ej. `sector-rs_vix25`)."""
+    parts: list[str] = []
+
+    if arguments.use_sector_relative_strength:
+        parts.append("sector-rs")
+
+    if arguments.vix_filter_threshold is not None:
+        parts.append(f"vix{arguments.vix_filter_threshold.normalize():f}")
+
+    return "_".join(parts) or None
 
 
 def build_calendar(name: str) -> TradingCalendar | None:
@@ -315,6 +410,11 @@ def build_request(
         source=arguments.source,
         adjustment_version=arguments.adjustment_version,
         include_dividends=not arguments.no_dividends,
+        reference_symbols=(
+            settings.universe(settings.signals.reference_universe)
+            if uses_signal_filters(arguments)
+            else ()
+        ),
     )
 
 
@@ -362,8 +462,9 @@ def report_label(
     settings: ApplicationSettings,
 ) -> str:
     """`<prefijo>[_<etiqueta>]_<universo o símbolos>_<inicio>_<fin>`."""
-    if arguments.report_tag:
-        prefix = f"{prefix}_{arguments.report_tag}"
+    for tag in (arguments.report_tag, signal_filter_tag(arguments)):
+        if tag:
+            prefix = f"{prefix}_{tag}"
 
     universe = selected_universe(arguments, settings)
 
@@ -389,6 +490,7 @@ def run_backtest_command(
         outcome = BacktestRunService(session, calendar=calendar).run(
             request,
             persist=not arguments.no_persist,
+            signal_generator=build_signal_generator(arguments, settings),
         )
 
     name = arguments.name or report_label("backtest", arguments, request, settings)
@@ -502,6 +604,17 @@ def format_summary(
             f"MDD B&H: {_pct(buy_and_hold.max_drawdown.max_drawdown_pct)}  "
             f"Dividendos B&H: {buy_and_hold.dividend_income:,.2f}  "
             f"Exceso: {_pct(buy_and_hold.strategy_excess_return)}"
+        )
+
+    if report.signal_filters is not None:
+        summary = report.signal_filters
+        blocked = ", ".join(
+            f"{name} {count}" for name, count in summary.filtered_by.items()
+        )
+        lines.append(
+            f"Filtros v2: {summary.strategy_id}  "
+            f"Señales bloqueadas: {summary.filtered_signals}"
+            + (f" ({blocked})" if blocked else "")
         )
 
     lines.extend([f"Informe JSON: {json_path}", f"Informe Markdown: {markdown_path}"])
