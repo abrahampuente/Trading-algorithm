@@ -5,6 +5,10 @@ from algo_trading.persistence.models.backtest import (
     BacktestTradeModel,
 )
 from algo_trading.persistence.models.base import Base
+from algo_trading.persistence.models.broker_orders import (
+    BrokerOrderModel,
+    OrderExecutionModel,
+)
 from algo_trading.persistence.models.corporate_actions import (
     CorporateAction,
     CorporateActionType,
@@ -22,4 +26,6 @@ __all__ = [
     "BacktestRunModel",
     "BacktestTradeModel",
     "BacktestEquitySnapshotModel",
+    "BrokerOrderModel",
+    "OrderExecutionModel",
 ]

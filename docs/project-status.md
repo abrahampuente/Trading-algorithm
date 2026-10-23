@@ -210,7 +210,27 @@ Envío idempotente: ante error de red o 5xx en el `POST` se consulta la orden po
 
 Configuración: sección `broker` en `local.yaml` (`BrokerSettings`) y `ALPACA_PAPER=true` en `.env` (añadido a `.env.example`); `build_alpaca_paper_broker(settings)`.
 
-Pendiente en el Hito 3: persistencia de órdenes, eventos y fills (migración); reconciliación con las posiciones del broker; primer ciclo manual en la cuenta paper (envío, fill, OCO, cancelación).
+Persistencia de órdenes y ejecuciones (migración `b7c8d9e0f1a2`, `alembic upgrade head`):
+
+```text
+broker_orders     id, client_order_id (UNIQUE), broker_order_id (UNIQUE), parent_client_order_id (patas OCO),
+                  símbolo, lado, cantidad, tipo, time_in_force, clase, límite / stop, TP / SL de la OCO,
+                  precio teórico, strategy_id, signal_timestamp, status (OrderStatus), broker_status,
+                  cantidad ejecutada, precio medio, created_at, submitted_at, filled_at,
+                  broker_updated_at, last_synced_at
+order_executions  id, order_id (FK broker_orders, ON DELETE CASCADE), execution_id (UNIQUE), executed_at,
+                  cantidad, precio, cantidad acumulada, comisión, source (activity / order_update)
+```
+
+- Timestamps `DATETIME(6)` en MySQL (UTC sin zona, con microsegundos) para medir latencias en el Hito 4; las tablas de la v1 siguen con precisión de segundo.
+- `BrokerOrderRepository` (no confirma la transacción):
+  - `record_submission(request, state)`: guarda la orden con el contexto de la solicitud (precio teórico para el slippage, estrategia, señal, TP / SL).
+  - `apply_state(state)`: valida la transición con `validate_transition` y que la cantidad ejecutada no baje (si no, `InvalidOrderTransitionError` sin cambios), actualiza la orden y guarda sus patas como órdenes hijas. Si la cantidad ejecutada crece, deduce el fill del incremento: `precio = (p1·q1 - p0·q0) / (q1 - q0)`, `execution_id = <client_order_id>:<cantidad acumulada>`. Repetir un estado es idempotente.
+  - `record_execution(execution)`: fill informado por el broker (actividades), idempotente por `execution_id`. Una sola fuente de fills por orden (`apply_state(..., deduce_executions=False)` con actividades).
+  - `get`, `get_record`, `list_open` (estados no finales, incluidas patas), `get_executions`.
+- Tests: SQLite (ciclo completo con fills parciales, cancelación tras fill parcial, OPG no ejecutada, OCO con patas, transiciones inválidas, idempotencia) e integración en MySQL (esquema real, unicidad de `client_order_id`, cascada, microsegundos).
+
+Pendiente en el Hito 3: conectar broker, planificador y repositorio en un servicio de envío y sincronización; reconciliación con las posiciones del broker; primer ciclo manual en la cuenta paper (envío, fill, OCO, cancelación).
 
 
 ## v1 cerrada (2026-10-23)
@@ -533,6 +553,8 @@ market_bars_raw
 corporate_actions
 market_bars_adjusted
 data_snapshots
+backtest_runs / backtest_trades / backtest_equity_snapshots
+broker_orders / order_executions   (v2, Hito 3)
 ```
 
 Restricciones relevantes:

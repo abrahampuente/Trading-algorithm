@@ -237,6 +237,31 @@ class OrderState(BaseModel):
         return self.quantity - self.filled_quantity
 
 
+class ExecutionSource(StrEnum):
+    BROKER_ACTIVITY = "activity"  # actividad de fill del broker, con su id
+    ORDER_UPDATE = "order_update"  # deducida del estado acumulado de la orden
+
+
+class OrderExecution(BaseModel):
+    """
+    Fill parcial o total de una orden.
+
+    Deducido de dos estados consecutivos (cantidad ejecutada `q0 → q1`, precio
+    medio `p0 → p1`), el precio del incremento es `(p1·q1 - p0·q0) / (q1 - q0)`.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    execution_id: str = Field(min_length=1, max_length=160)
+    client_order_id: str
+    executed_at: datetime
+    quantity: Decimal = Field(gt=0)
+    price: Decimal = Field(gt=0)
+    cumulative_quantity: Decimal = Field(gt=0)
+    commission: Decimal = Field(default=Decimal("0"), ge=0)
+    source: ExecutionSource = ExecutionSource.ORDER_UPDATE
+
+
 class OrderEvent(BaseModel):
     """Cambio de estado observado de una orden."""
 
