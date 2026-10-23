@@ -51,7 +51,6 @@ if TYPE_CHECKING:
     from algo_trading.config.settings import ApplicationSettings
 
 DEFAULT_SYMBOLS = ("AAPL", "MSFT", "GOOGL", "SPY", "QQQ")
-DEFAULT_UNIVERSE = "initial"
 DEFAULT_START = date(2020, 1, 1)
 DEFAULT_ADJUSTMENT_VERSION = "splits-v1"
 DAILY = Timeframe.DAILY.value
@@ -244,7 +243,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     selection.add_argument(
         "--universe",
         default=None,
-        help="Universo de la configuración (por defecto: initial).",
+        help="Universo de la configuración (por defecto: default_universe).",
     )
     parser.add_argument(
         "--start",
@@ -270,11 +269,11 @@ def resolve_symbols(
     arguments: argparse.Namespace,
     settings: "ApplicationSettings",
 ) -> tuple[str, ...]:
-    """`--symbols` explícitos, o los del `--universe` (por defecto `initial`)."""
+    """`--symbols` explícitos, o los del `--universe` (por defecto, el configurado)."""
     if arguments.symbols:
         return tuple(symbol.upper() for symbol in arguments.symbols)
 
-    return settings.universe(arguments.universe or DEFAULT_UNIVERSE)
+    return settings.universe(arguments.universe or settings.default_universe)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

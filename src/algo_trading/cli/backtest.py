@@ -65,7 +65,6 @@ from algo_trading.backtesting.sensitivity import (
 from algo_trading.cli.ingest import (
     DEFAULT_ADJUSTMENT_VERSION,
     DEFAULT_START,
-    DEFAULT_UNIVERSE,
     default_end_date,
 )
 from algo_trading.config.settings import (
@@ -96,7 +95,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     selection.add_argument(
         "--universe",
         default=None,
-        help="Universo de la configuración (por defecto: initial).",
+        help="Universo de la configuración (por defecto: default_universe).",
     )
     parser.add_argument("--start", type=date.fromisoformat, default=DEFAULT_START)
     parser.add_argument(
@@ -120,14 +119,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--stop-loss-atr",
         type=Decimal,
-        default=Decimal("1"),
-        help="Multiplicador de ATR para el stop loss (v1: 1).",
+        default=None,
+        help="Multiplicador de ATR para el stop loss (por defecto: configuración).",
     )
     parser.add_argument(
         "--take-profit-atr",
         type=Decimal,
-        default=Decimal("2"),
-        help="Multiplicador de ATR para el take profit (v1: 2).",
+        default=None,
+        help="Multiplicador de ATR para el take profit (por defecto: configuración).",
     )
     parser.add_argument(
         "--max-positions",
@@ -139,14 +138,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--risk-per-trade",
         type=Decimal,
-        default=Decimal("0.005"),
-        help="Riesgo por operación sobre el equity (v1: 0.005).",
+        default=None,
+        help="Riesgo por operación sobre el equity (por defecto: configuración).",
     )
     parser.add_argument(
         "--max-position-exposure",
         type=Decimal,
-        default=Decimal("0.10"),
-        help="Exposición nominal máxima por posición (v1: 0.10).",
+        default=None,
+        help="Exposición nominal máxima por posición (por defecto: configuración).",
     )
     parser.add_argument("--source", default=YFINANCE_SOURCE)
     parser.add_argument("--adjustment-version", default=DEFAULT_ADJUSTMENT_VERSION)
@@ -281,6 +280,7 @@ def build_request(
 ) -> BacktestRunRequest:
     profile_name = arguments.cost_profile.lower()
     profile = settings.cost_profile(profile_name)
+    strategy = settings.strategy
     costs = CostModel(
         commission_rate=profile.commission_rate,
         slippage_rate=profile.slippage_rate,
@@ -290,10 +290,18 @@ def build_request(
         cost_profile=profile_name,
         risk=RiskParameters(
             max_positions=arguments.max_positions or settings.max_positions,
-            risk_per_trade=arguments.risk_per_trade,
-            max_position_exposure=arguments.max_position_exposure,
-            stop_loss_atr_multiple=arguments.stop_loss_atr,
-            take_profit_atr_multiple=arguments.take_profit_atr,
+            risk_per_trade=_or_default(
+                arguments.risk_per_trade, strategy.risk_per_trade
+            ),
+            max_position_exposure=_or_default(
+                arguments.max_position_exposure, strategy.max_position_exposure
+            ),
+            stop_loss_atr_multiple=_or_default(
+                arguments.stop_loss_atr, strategy.stop_loss_atr_multiple
+            ),
+            take_profit_atr_multiple=_or_default(
+                arguments.take_profit_atr, strategy.take_profit_atr_multiple
+            ),
             commission_rate=costs.commission_rate,
         ),
         costs=costs,
@@ -314,11 +322,22 @@ def resolve_symbols(
     arguments: argparse.Namespace,
     settings: ApplicationSettings,
 ) -> tuple[str, ...]:
-    """`--symbols` explícitos, o los del `--universe` (por defecto `initial`)."""
+    """`--symbols` explícitos, o los del universo seleccionado."""
     if arguments.symbols:
         return tuple(symbol.upper() for symbol in arguments.symbols)
 
-    return settings.universe(arguments.universe or DEFAULT_UNIVERSE)
+    return settings.universe(selected_universe(arguments, settings) or "")
+
+
+def selected_universe(
+    arguments: argparse.Namespace,
+    settings: ApplicationSettings,
+) -> str | None:
+    """`--universe`, o el universo por defecto si no hay `--symbols`."""
+    if arguments.symbols:
+        return None
+
+    return (arguments.universe or settings.default_universe).lower()
 
 
 def build_grid(
@@ -340,15 +359,17 @@ def report_label(
     prefix: str,
     arguments: argparse.Namespace,
     request: BacktestRunRequest,
+    settings: ApplicationSettings,
 ) -> str:
     """`<prefijo>[_<etiqueta>]_<universo o símbolos>_<inicio>_<fin>`."""
     if arguments.report_tag:
         prefix = f"{prefix}_{arguments.report_tag}"
 
-    if arguments.universe:
+    universe = selected_universe(arguments, settings)
+
+    if universe:
         return (
-            f"{prefix}_{arguments.universe.lower()}_"
-            f"{request.start.isoformat()}_{request.end.isoformat()}"
+            f"{prefix}_{universe}_{request.start.isoformat()}_{request.end.isoformat()}"
         )
 
     return prefix + default_report_name(
@@ -370,7 +391,7 @@ def run_backtest_command(
             persist=not arguments.no_persist,
         )
 
-    name = arguments.name or report_label("backtest", arguments, request)
+    name = arguments.name or report_label("backtest", arguments, request, settings)
     json_path, markdown_path = write_report(outcome.report, arguments.output_dir, name)
     return outcome, json_path, markdown_path
 
@@ -390,7 +411,7 @@ def run_sweep_command(
         ).run(request, grid, persist=not arguments.no_persist)
 
     name = arguments.name or (
-        report_label("sensitivity", arguments, request)
+        report_label("sensitivity", arguments, request, settings)
         + f"_{request.parameters.cost_profile}"
     )
     json_path, markdown_path = write_sensitivity_report(
@@ -431,11 +452,11 @@ def run_walk_forward_command(
         config,
         start=request.start,
         end=request.end,
-        universe=arguments.universe.lower() if arguments.universe else None,
+        universe=selected_universe(arguments, settings),
     )
 
     name = arguments.name or (
-        report_label("walk_forward", arguments, request)
+        report_label("walk_forward", arguments, request, settings)
         + f"_{request.parameters.cost_profile}"
         + f"_is{config.in_sample_months}-oos{config.out_of_sample_months}"
         + f"_{config.selection_metric}"
@@ -666,6 +687,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     print(format_summary(outcome, json_path, markdown_path))
     return 0
+
+
+def _or_default(value: Decimal | None, default: Decimal) -> Decimal:
+    return value if value is not None else default
 
 
 def _pct(value: Decimal | None) -> str:

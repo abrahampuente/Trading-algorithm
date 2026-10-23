@@ -17,6 +17,7 @@ from algo_trading.backtesting.run_service import (
     default_report_name,
 )
 from algo_trading.cli.backtest import (
+    build_request,
     format_runs,
     format_summary,
     format_sweep_summary,
@@ -404,7 +405,8 @@ def test_cli_defaults() -> None:
 
     assert arguments.symbols is None
     assert arguments.universe is None
-    assert arguments.take_profit_atr == Decimal("2")
+    # Sin argumentos, los valores salen de la configuración (build_request).
+    assert arguments.take_profit_atr is None
     assert arguments.tp_multiples == [Decimal("2.0")]
     assert arguments.start == date(2020, 1, 1)
     assert arguments.end is None
@@ -416,8 +418,10 @@ def test_cli_defaults() -> None:
     assert not arguments.no_dividends
     assert arguments.list_runs is None
     assert arguments.cost_profile == "base"
-    assert arguments.stop_loss_atr == Decimal("1")
-    assert arguments.max_position_exposure == Decimal("0.10")
+    assert arguments.stop_loss_atr is None
+    assert arguments.max_position_exposure is None
+    assert arguments.risk_per_trade is None
+    assert arguments.max_positions is None
     assert not arguments.sweep
     assert arguments.sl_multiples == [Decimal("1.0"), Decimal("1.5"), Decimal("2.0")]
     assert arguments.exposures == [Decimal("0.10"), Decimal("0.15"), Decimal("0.20")]
@@ -643,7 +647,7 @@ def test_sweep_includes_take_profit_axis(engine: Engine, tmp_path: Path) -> None
     ]
     # El escenario cierra en TP con 2 x ATR; con 3 x ATR no se alcanza (fin de datos).
     assert report.rows[0].cumulative_return != report.rows[1].cumulative_return
-    assert "| 1 | 3 | 10.00 % | 5 | 0.50 % |" in markdown_path.read_text(
+    assert "| 1 | 3 | 10.00 % | 5 | 1.00 % |" in markdown_path.read_text(
         encoding="utf-8"
     )
 
@@ -672,6 +676,74 @@ def test_universe_label_is_used_in_report_names(
             [
                 "--universe",
                 "tiny",
+                "--start",
+                "2024-01-01",
+                "--end",
+                "2024-01-23",
+                "--output-dir",
+                str(tmp_path),
+                "--no-persist",
+            ]
+        ),
+        session_factory=sessionmaker(bind=engine),
+        settings=settings,
+        calendar=None,
+    )
+
+    assert json_path.name == "backtest_tiny_2024-01-01_2024-01-23.json"
+
+
+def test_request_uses_locked_v1_strategy_defaults() -> None:
+    request = build_request(parse_args(["--end", "2026-10-22"]), SETTINGS)
+
+    risk = request.parameters.risk
+    assert request.symbols == SETTINGS.universe("diversified")
+    assert len(request.symbols) == 15
+    assert risk.max_positions == 5
+    assert risk.risk_per_trade == Decimal("0.01")
+    assert risk.stop_loss_atr_multiple == Decimal("2.0")
+    assert risk.take_profit_atr_multiple == Decimal("3.0")
+    assert risk.max_position_exposure == Decimal("0.20")
+    assert request.parameters.cost_profile == "base"
+
+
+def test_explicit_arguments_override_configuration() -> None:
+    request = build_request(
+        parse_args(
+            [
+                "--symbols",
+                "AAPL",
+                "--risk-per-trade",
+                "0.005",
+                "--stop-loss-atr",
+                "1",
+                "--take-profit-atr",
+                "2",
+                "--max-position-exposure",
+                "0.10",
+                "--max-positions",
+                "3",
+            ]
+        ),
+        SETTINGS,
+    )
+
+    risk = request.parameters.risk
+    assert request.symbols == ("AAPL",)
+    assert (risk.max_positions, risk.risk_per_trade) == (3, Decimal("0.005"))
+    assert risk.stop_loss_atr_multiple == Decimal("1")
+    assert risk.take_profit_atr_multiple == Decimal("2")
+    assert risk.max_position_exposure == Decimal("0.10")
+
+
+def test_default_universe_names_reports(engine: Engine, tmp_path: Path) -> None:
+    settings = SETTINGS.model_copy(
+        update={"universes": {"tiny": ("AAA",)}, "default_universe": "tiny"}
+    )
+
+    _, json_path, _ = run_backtest_command(
+        parse_args(
+            [
                 "--start",
                 "2024-01-01",
                 "--end",

@@ -211,12 +211,13 @@ def test_rejects_end_before_start(engine: Engine) -> None:
         )
 
 
-def test_parse_args_defaults_to_initial_universe() -> None:
+def test_parse_args_defaults_to_configured_universe() -> None:
     arguments = parse_args([])
 
     assert arguments.symbols is None
     assert arguments.universe is None
-    assert resolve_symbols(arguments, SETTINGS) == (
+    assert resolve_symbols(arguments, SETTINGS) == SETTINGS.universe("diversified")
+    assert resolve_symbols(parse_args(["--universe", "initial"]), SETTINGS) == (
         "AAPL",
         "MSFT",
         "GOOGL",

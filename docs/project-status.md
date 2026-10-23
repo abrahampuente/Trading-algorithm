@@ -1,5 +1,33 @@
 # Estado del proyecto — Algo Trading
 
+## Estado actual: v1 cerrada (2026-10-23)
+
+La v1 (backtesting diario, sin órdenes reales) queda cerrada con estos valores por defecto, definidos en `configs/environments/local.yaml` y usados por `algo-ingest` y `algo-backtest` cuando no se indican argumentos:
+
+```text
+Universo por defecto        diversified (15 activos): AAPL MSFT GOOGL QQQ SPY XOM JPM JNJ PG CAT GLD TLT XLE XLF XLV
+max_positions               5
+risk_per_trade              0.01  (1,0 % del equity)
+stop_loss_atr_multiple      2.0   (SL = entrada - 2 × ATR)
+take_profit_atr_multiple    3.0   (TP = entrada + 3 × ATR)
+max_position_exposure       0.20  (20 % del equity por posición)
+Perfil de costes            base (0,05 % comisión + 0,05 % slippage)
+Calendario / dividendos     NYSE / acreditados en cash
+```
+
+Validación por Walk-Forward Optimization (IS 36 meses / OOS 12 meses, OOS 2023-01-01 → 2026-10-22, universo diversificado):
+
+- WFE entre 89,8 % (rejilla SL × TP × exposición, 5 posiciones y 0,5 % de riesgo) y 132 % (nivel 5 posiciones / 1 % de riesgo del estudio de escalado).
+- **Resultado OOS de referencia** (walk-forward con 5 posiciones y 1 % de riesgo): **+14,05 % de retorno acumulado, MDD 5,49 %, Sharpe 0,64**. En ese walk-forward el SL, el TP y la exposición se re-optimizaban en cada ventana; eligió SL 2,0 y TP 3,0 en tres de cuatro ventanas, con exposición 15 %, 20 %, 10 % y 20 %.
+- El conjunto fijo bloqueado, aplicado sin re-optimizar al mismo periodo OOS, da +12,44 %, MDD 6,88 % y Sharpe 0,49. No es estrictamente fuera de muestra: los valores se eligieron tras ver los resultados del walk-forward.
+- Backtest de confirmación con los valores por defecto (`algo-backtest`, 2020-01-02 → 2026-10-22, run `1fe790dc-6bf2-4c5c-aa41-35186937afc1` en `backtest_runs`): +26,29 %, MDD 8,13 %, Profit Factor 1,21, 332 trades, Win Rate 47,6 %, tiempo en mercado 81 %, exposición media 40,7 %, dividendos 5.720,64. Buy & Hold diversificado del mismo periodo: +184,19 % (MDD 28,41 %). Este periodo incluye los datos con los que se eligieron los parámetros: no es una medida fuera de muestra.
+
+Notas sobre los valores bloqueados:
+
+- 5 posiciones × 1 % de riesgo implican un riesgo teórico simultáneo del 5 %, por encima del 2,5 % de la especificación v1 original (decisión explícita al cerrar la v1).
+- Los valores por defecto de dominio (`RiskParameters`: 0,5 %, SL 1×, TP 2×, 10 %) siguen siendo los de la especificación original; los valores de la v1 se aplican desde la configuración (`ApplicationSettings.strategy`, `default_universe`). Cualquier argumento explícito de la CLI los sustituye.
+- La estrategia conserva fuera de muestra una ventaja positiva y estable con drawdowns bajos, pero su retorno absoluto queda muy por debajo de Buy & Hold en este periodo alcista.
+
 ## 1. Propósito
 
 Construir un sistema modular de trading algorítmico Long para activos líquidos, orientado a investigación y backtesting reproducible.
@@ -819,6 +847,12 @@ Diagnóstico del capital ocioso:
 - Optimizar también la escala (108 combinaciones) da menos que fijar 5 posiciones (9,48 % frente a 11-14 %): más grados de libertad añaden ruido de selección aunque el WFE siga alto.
 - Conclusión: el cuello de botella es la frecuencia de señales × el tope de exposición por posición, no el número de plazas ni el riesgo. Mantener 5 posiciones y 0,5-1,0 % de riesgo (con 1,0 % se supera el límite teórico de 2,5 % de la especificación v1: 5 %). Las palancas útiles son la exposición máxima por posición y más señales.
 
+### Cierre de la v1: valores por defecto bloqueados
+
+- `ApplicationSettings.strategy` (`StrategySettings`: `risk_per_trade`, `stop_loss_atr_multiple`, `take_profit_atr_multiple`, `max_position_exposure`) y `default_universe` (validado contra `universes`) se leen de `local.yaml`.
+- `algo-backtest`: `--risk-per-trade`, `--stop-loss-atr`, `--take-profit-atr` y `--max-position-exposure` valen `None` por defecto y toman el valor de la configuración; `--max-positions` toma `max_positions`. Sin `--symbols` ni `--universe`, ambas CLIs usan `default_universe`, que también da nombre a los informes.
+- Las rejillas de barrido y walk-forward mantienen sus valores por defecto explícitos (`--sl-multiples`, `--tp-multiples`, `--exposures`); las de posiciones y riesgo, sin `--positions-grid` / `--risk-grid`, usan los valores base de la configuración.
+
 ### Métricas e informes (Hito 4)
 
 `calculate_performance_metrics(result, bars_by_symbol)` (`analytics/metrics.py`):
@@ -1146,10 +1180,11 @@ Completado:
 - Walk-Forward Optimization con curva OOS encadenada y Eficiencia Walk-Forward (`--walk-forward`).
 - Universo diversificado (15 símbolos) ingerido; rejilla con eje de TP; walk-forward con uso de capital y Buy & Hold diversificado.
 - Escalado de cartera (posiciones y riesgo) en la rejilla y estudio de escalado por nivel en el walk-forward; señales precalculadas (≈10× más rápido).
+- **Cierre de la v1**: valores por defecto bloqueados (diversified, 5 posiciones, 1 % de riesgo, SL 2×, TP 3×, exposición 20 %) y backtest de confirmación guardado.
 
 Orden inmediato:
 
-1. Capital ocioso: evaluar en walk-forward topes de exposición por posición mayores (25-35 %) con 5 posiciones, y fuentes de más señales (universo más amplio, umbral anti-gap en la rejilla), manteniendo el MDD acotado.
+1. v2: más señales (universo más amplio, umbral anti-gap en la rejilla) y topes de exposición mayores, validados con walk-forward sobre datos posteriores al cierre de la v1 (fuera de muestra real).
 2. Reintentos con backoff para el proveedor real y validación de calidad de datos (saltos de precio, volumen cero).
 3. Decidir proveedor y granularidad intradía antes de implementar su adaptador y la simulación intradía (usando horarios y cierres tempranos del calendario).
 
@@ -1168,9 +1203,9 @@ Python: 3.13.3
 Sistema operativo: Windows 11
 IDE: VS Code
 Base de datos: MySQL 8.0 mediante Docker Compose
-Estado: v1 completa en datos diarios: ingesta real, calendario NYSE, dividendos, indicadores, señales Long, gestión monetaria, backtesting persistido, perfiles de costes, barridos de parámetros, walk-forward sobre universo diversificado con estudio de escalado de cartera, métricas e informes
+Estado: v1 cerrada (2026-10-23) con valores por defecto bloqueados: universo diversified, 5 posiciones, 1 % de riesgo, SL 2 × ATR, TP 3 × ATR, exposición 20 %
 Validaciones: pytest, ruff y mypy están en verde
-Siguiente tarea: topes de exposición por posición mayores y más señales en walk-forward
+Siguiente tarea: planificar la v2 (más señales y validación fuera de muestra real)
 Fuente de verdad: docs/project-status.md
 ```
 
@@ -1184,8 +1219,8 @@ ruff format --check .
 mypy src
 ```
 
-No regenerar módulos ya implementados. Continuar desde la evaluación de topes de exposición mayores y más señales en el walk-forward diversificado.
+No regenerar módulos ya implementados. La v1 está cerrada: no cambiar sus valores por defecto sin una nueva validación walk-forward.
 
 Al abrir el siguiente chat, bastará con indicar:
 
-> Este proyecto continúa desde `docs/project-status.md`. Lee ese estado y no regeneres módulos ya implementados. El siguiente paso es evaluar en walk-forward topes de exposición por posición mayores (con 5 posiciones) y fuentes de más señales.
+> Este proyecto continúa desde `docs/project-status.md`. Lee ese estado y no regeneres módulos ya implementados. La v1 está cerrada con valores por defecto bloqueados; el siguiente paso es planificar la v2.

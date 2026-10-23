@@ -61,3 +61,23 @@ def test_local_settings_define_initial_and_diversified_universes() -> None:
         "XLF",
         "XLV",
     )
+
+
+def test_local_settings_lock_v1_strategy_defaults() -> None:
+    settings = ApplicationSettings.from_yaml()
+
+    assert settings.max_positions == 5
+    assert settings.default_universe == "diversified"
+    assert settings.strategy.risk_per_trade == Decimal("0.01")
+    assert settings.strategy.stop_loss_atr_multiple == Decimal("2.0")
+    assert settings.strategy.take_profit_atr_multiple == Decimal("3.0")
+    assert settings.strategy.max_position_exposure == Decimal("0.20")
+
+
+def test_default_universe_must_exist() -> None:
+    settings = ApplicationSettings.from_yaml()
+
+    with pytest.raises(ValueError, match="default_universe"):
+        ApplicationSettings.model_validate(
+            {**settings.model_dump(), "default_universe": "global"}
+        )

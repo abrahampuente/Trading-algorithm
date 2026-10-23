@@ -5,6 +5,17 @@ log_level: INFO
 initial_capital: 100000.00
 max_positions: 5
 
+# Parámetros por defecto de la estrategia v1 (bloqueados tras el
+# walk-forward sobre el universo diversificado; ver docs/project-status.md).
+strategy:
+  risk_per_trade: 0.01            # 1,0 % del equity por operación
+  stop_loss_atr_multiple: 2.0     # SL = entrada - 2 x ATR
+  take_profit_atr_multiple: 3.0   # TP = entrada + 3 x ATR
+  max_position_exposure: 0.20     # 20 % del equity por posición
+
+# Universo por defecto de algo-ingest y algo-backtest.
+default_universe: diversified
+
 database:
   host: localhost
   port: 3306

@@ -3,7 +3,7 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -38,7 +38,21 @@ def default_cost_profiles() -> dict[str, CostProfileSettings]:
     }
 
 
-DEFAULT_UNIVERSE = "initial"
+DEFAULT_UNIVERSE = "diversified"
+
+
+class StrategySettings(BaseModel):
+    """
+    Parámetros por defecto de la estrategia v1 bloqueados tras el walk-forward.
+
+    Las CLIs los usan cuando no se indican explícitamente. Los valores por
+    defecto de `RiskParameters` (especificación original) no cambian.
+    """
+
+    risk_per_trade: Decimal = Field(default=Decimal("0.01"), gt=0, le=1)
+    stop_loss_atr_multiple: Decimal = Field(default=Decimal("2.0"), gt=0)
+    take_profit_atr_multiple: Decimal = Field(default=Decimal("3.0"), gt=0)
+    max_position_exposure: Decimal = Field(default=Decimal("0.20"), gt=0, le=1)
 
 
 def default_universes() -> dict[str, tuple[str, ...]]:
@@ -98,6 +112,19 @@ class ApplicationSettings(BaseSettings):
         default_factory=default_universes,
         min_length=1,
     )
+    default_universe: str = DEFAULT_UNIVERSE
+    strategy: StrategySettings = Field(default_factory=StrategySettings)
+
+    @model_validator(mode="after")
+    def validate_default_universe(self) -> "ApplicationSettings":
+        if self.default_universe.lower() not in {
+            name.lower() for name in self.universes
+        }:
+            raise ValueError(
+                f"default_universe '{self.default_universe}' no está en universes"
+            )
+
+        return self
 
     database_password: str | None = None
 
