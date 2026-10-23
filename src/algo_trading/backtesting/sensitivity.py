@@ -19,6 +19,7 @@ DEFAULT_TAKE_PROFIT_ATR_MULTIPLES = (Decimal("2.0"),)
 EXTENDED_TAKE_PROFIT_ATR_MULTIPLES = (Decimal("2.0"), Decimal("2.5"), Decimal("3.0"))
 DEFAULT_MAX_POSITIONS = (5,)
 DEFAULT_RISK_PER_TRADE = (Decimal("0.005"),)
+DEFAULT_USE_SECTOR_FILTER = (False,)
 NOT_AVAILABLE = "n/d"
 
 
@@ -26,8 +27,11 @@ class ParameterCombination(BaseModel):
     """
     Una combinación de la rejilla.
 
-    Niveles de salida (SL y TP en ATR), exposición máxima por posición y
-    escala de cartera (posiciones simultáneas y riesgo por operación).
+    Niveles de salida (SL y TP en ATR), exposición máxima por posición,
+    escala de cartera (posiciones simultáneas y riesgo por operación) y uso
+    del filtro v2 de fuerza relativa sectorial. El filtro no forma parte de
+    `BacktestParameters`: cambia el generador de señales, así que lo aplica
+    quien ejecuta la combinación (walk-forward), no `apply`.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -37,6 +41,7 @@ class ParameterCombination(BaseModel):
     max_position_exposure: Decimal = Field(gt=0, le=1)
     max_positions: int = Field(default=5, ge=1)
     risk_per_trade: Decimal = Field(default=Decimal("0.005"), gt=0, le=1)
+    use_sector_filter: bool = False
 
     @property
     def scale(self) -> tuple[int, Decimal]:
@@ -68,6 +73,9 @@ class ParameterGrid(BaseModel):
     0,5 % de riesgo (rejilla 3 × 3 de SL y exposición);
     `EXTENDED_TAKE_PROFIT_ATR_MULTIPLES` amplía el TP y `max_positions` /
     `risk_per_trade` permiten estudiar la escala de la cartera.
+    `use_sector_filter` = `(False, True)` compara la señal v1 con y sin el
+    filtro de fuerza relativa sectorial (sólo en walk-forward); con el valor
+    por defecto `(False,)` la rejilla es la de la v1.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -90,6 +98,10 @@ class ParameterGrid(BaseModel):
     )
     risk_per_trade: tuple[Decimal, ...] = Field(
         default=DEFAULT_RISK_PER_TRADE,
+        min_length=1,
+    )
+    use_sector_filter: tuple[bool, ...] = Field(
+        default=DEFAULT_USE_SECTOR_FILTER,
         min_length=1,
     )
 
@@ -118,6 +130,7 @@ class ParameterGrid(BaseModel):
             ("max_position_exposures", self.max_position_exposures),
             ("max_positions", self.max_positions),
             ("risk_per_trade", self.risk_per_trade),
+            ("use_sector_filter", self.use_sector_filter),
         ):
             if len(set(values)) != len(values):
                 raise ValueError(f"{name} no puede contener duplicados")
@@ -125,7 +138,10 @@ class ParameterGrid(BaseModel):
         return self
 
     def combinations(self) -> tuple[ParameterCombination, ...]:
-        """Combinaciones en orden de rejilla: SL, TP, exposición, posiciones, riesgo."""
+        """
+        Combinaciones en orden de rejilla: SL, TP, exposición, posiciones,
+        riesgo y filtro sectorial (el eje más interno).
+        """
         return tuple(
             ParameterCombination(
                 stop_loss_atr_multiple=stop_loss,
@@ -133,15 +149,23 @@ class ParameterGrid(BaseModel):
                 max_position_exposure=exposure,
                 max_positions=positions,
                 risk_per_trade=risk,
+                use_sector_filter=sector_filter,
             )
-            for stop_loss, take_profit, exposure, positions, risk in product(
-                self.stop_loss_atr_multiples,
-                self.take_profit_atr_multiples,
-                self.max_position_exposures,
-                self.max_positions,
-                self.risk_per_trade,
+            for stop_loss, take_profit, exposure, positions, risk, sector_filter in (
+                product(
+                    self.stop_loss_atr_multiples,
+                    self.take_profit_atr_multiples,
+                    self.max_position_exposures,
+                    self.max_positions,
+                    self.risk_per_trade,
+                    self.use_sector_filter,
+                )
             )
         )
+
+    @property
+    def includes_sector_filter(self) -> bool:
+        return True in self.use_sector_filter
 
     def scale_levels(self) -> tuple[tuple[int, Decimal], ...]:
         """Niveles de escala (posiciones, riesgo) en el orden de la rejilla."""
@@ -213,6 +237,11 @@ class SensitivityAnalysisService:
         grid: ParameterGrid,
         persist: bool = True,
     ) -> SensitivityReport:
+        if grid.includes_sector_filter:
+            raise ValueError(
+                "El filtro sectorial sólo se evalúa en walk-forward, no en barridos"
+            )
+
         data = self._run_service.prepare(request)
         sweep_id = self._id_factory() if persist else None
         rows: list[SensitivityRow] = []

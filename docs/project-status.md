@@ -59,7 +59,44 @@ Buy & Hold diversificado: 184.19 % (MDD 28.41 %)
 - El filtro VIX empeora todo: las rupturas con VIX alto (rebotes tras correcciones) son de las mejores señales de la estrategia. Cuanto más estricto, peor.
 - Es una comparación dentro de la muestra con parámetros de filtro no optimizados; antes de adoptar el filtro sectorial hay que validarlo con walk-forward (falta añadir los filtros a la rejilla).
 
-Pendiente en el Hito 1: filtros en la rejilla de barrido y walk-forward; confirmación por volumen; Short y reversión a la media (requieren generalizar `EntryCandidate` más allá de `LongSignal`).
+### Filtro sectorial en walk-forward
+
+- `ParameterGrid.use_sector_filter` (por defecto `(False,)`, la rejilla v1) es el eje más interno de la rejilla; `ParameterCombination` y `PeriodEvaluation` llevan `use_sector_filter`. Con `(False, True)` los empates IS se quedan con la señal sin filtro. El barrido (`--sweep`) no lo admite.
+- `WalkForwardAnalyzer(..., reference_bars=..., sector_filter=...)`: las series de referencia llegan en la misma carga de MySQL que las barras (`BacktestRunService.prepare`, una sola sesión) y las señales filtradas se calculan una vez sobre todo el historial por parámetros de señal. Como el filtro sólo ve `SignalContext.until(t)`, valen para cualquier ventana (test de invariancia frente a un cálculo sobre datos truncados).
+- Estudio por variante (`SectorFilterStudyResult`, informe `walk-forward-report-v4`): walk-forward restringido a sin filtro y a con filtro, más el optimizado en el que cada IS elige; frecuencia de selección (`sector_filter_selections`) y señales bloqueadas. Un test comprueba que cada variante coincide con un walk-forward ejecutado sólo con ese valor.
+- CLI: `algo-backtest --walk-forward --sector-filter-grid off on` (sólo con `--walk-forward`).
+
+Ejecución (diversified, IS 36 / OOS 12, Profit Factor, perfil base, 5 posiciones, 1 % de riesgo, SL 1,5 / 2,0, TP 2,5 / 3,0, exposición 10 / 15 / 20 %, filtro off / on: 24 combinaciones por ventana, 14 s):
+
+```powershell
+algo-backtest --walk-forward --universe diversified --sl-multiples 1.5 2.0 --tp-multiples 2.5 3.0 `
+  --exposures 0.10 0.15 0.20 --sector-filter-grid off on --report-tag sector_filter
+```
+
+Informe: `reports/walk_forward_sector_filter_diversified_2020-01-01_2026-10-22_base_is36-oos12_profit_factor.md`.
+
+```text
+Variante               Retorno OOS  Anual.   MDD     PF    Sharpe  Exposición  Trades  WFE
+Sin filtro (v1)        14.05 %      3.51 %   5.49 %  1.28  0.64    33.5 %      198     131.63 %
+Con filtro sectorial    8.99 %      2.29 %   3.48 %  1.40  0.76    15.4 %      154     155.51 %
+Optimizado (IS elige)  13.14 %      3.29 %   5.49 %  1.35  0.72    26.8 %      177     133.14 %
+Buy & Hold diversificado OOS: 108.77 %
+
+#  OOS   Elegido  PF IS sin / con  Retorno OOS sin / con  MDD OOS sin / con
+1  2023  base     1.24 / 1.23      1.05 % / 1.49 %        5.49 % / 2.95 %
+2  2024  base     1.21 / 1.20      7.07 % / 2.72 %        3.22 % / 1.50 %
+3  2025  filtro   1.24 / 1.41      0.15 % / 0.11 %        2.57 % / 2.84 %
+4  2026  filtro   1.14 / 1.22      5.25 % / 4.43 %        3.95 % / 1.22 %
+```
+
+Lectura:
+
+- La variante sin filtro reproduce exactamente el walk-forward de referencia de la v1 (14,05 %, MDD 5,49 %, WFE 131,63 %).
+- El filtro es robusto fuera de muestra (WFE 155 %) y mejora la calidad: PF 1,28 → 1,40, Sharpe 0,64 → 0,76 y MDD 5,5 % → 3,5 % (menor en 3 de 4 ventanas). Pero reduce el retorno OOS del 14,1 % al 9,0 % porque deja la mitad del capital ocioso (exposición media 33 % → 15 %). Retorno / MDD es prácticamente igual (2,56 frente a 2,58).
+- La selección IS lo elige en 2 de 4 ventanas (2025 y 2026) y en las dos primeras queda casi empatado (PF IS 1,24 / 1,23 y 1,21 / 1,20): el IS no lo distingue con claridad. El optimizado queda entre ambos (13,1 %).
+- Decisión: no se activa por defecto. Es una palanca de riesgo (menos drawdown y exposición), no de retorno. Su valor dependerá de reinvertir el capital liberado (topes de exposición mayores con filtro o más señales), que hay que validar con un nuevo walk-forward antes de usar el hold-out posterior al 2026-10-22.
+
+Pendiente en el Hito 1: filtro sectorial con topes de exposición mayores; confirmación por volumen; Short y reversión a la media (requieren generalizar `EntryCandidate` más allá de `LongSignal`).
 
 ## v1 cerrada (2026-10-23)
 

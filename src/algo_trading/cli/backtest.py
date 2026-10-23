@@ -14,6 +14,8 @@ Uso:
         --risk-grid 0.005 0.01 0.015 --report-tag portfolio_scaling
     algo-backtest --list-runs 10
     algo-backtest --use-sector-relative-strength --vix-filter-threshold 25
+    algo-backtest --walk-forward --universe diversified --sector-filter-grid off on \
+        --report-tag sector_filter
 
 Lee `market_bars_adjusted` y los dividendos, valida las series contra el
 calendario de mercado, ejecuta la estrategia v1, guarda la ejecución en
@@ -32,7 +34,8 @@ Eficiencia Walk-Forward (WFE).
 Con `--use-sector-relative-strength` y/o `--vix-filter-threshold`, las
 señales v1 pasan por los filtros de régimen v2 (`signals/`) con las series de
 referencia de `signals.reference_universe`. Sin esas opciones, el backtest es
-exactamente el de la v1.
+exactamente el de la v1. En walk-forward, `--sector-filter-grid off on` añade
+el filtro sectorial como eje de la rejilla: cada IS decide si usarlo.
 """
 
 import argparse
@@ -97,6 +100,8 @@ from algo_trading.signals import (
 
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "reports"
 NO_CALENDAR = "none"
+SECTOR_FILTER_OFF = "off"
+SECTOR_FILTER_ON = "on"
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -277,6 +282,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "frente al benchmark (configuración signals).",
     )
     parser.add_argument(
+        "--sector-filter-grid",
+        nargs="+",
+        choices=[SECTOR_FILTER_OFF, SECTOR_FILTER_ON],
+        default=None,
+        help="Walk-forward: eje del filtro sectorial en la rejilla (p. ej. "
+        "'off on'; por defecto sólo off, la señal v1).",
+    )
+    parser.add_argument(
         "--vix-filter-threshold",
         type=Decimal,
         default=None,
@@ -293,10 +306,37 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     if uses_signal_filters(arguments) and (arguments.sweep or arguments.walk_forward):
         parser.error(
             "Los filtros de régimen v2 sólo están disponibles en un backtest "
-            "individual (sin --sweep ni --walk-forward)"
+            "individual (sin --sweep ni --walk-forward); en walk-forward, use "
+            "--sector-filter-grid"
         )
 
+    if arguments.sector_filter_grid and not arguments.walk_forward:
+        parser.error("--sector-filter-grid sólo se usa con --walk-forward")
+
     return arguments
+
+
+def sector_filter_grid(arguments: argparse.Namespace) -> tuple[bool, ...]:
+    """Valores del eje `use_sector_filter`; sin opción, sólo la señal v1."""
+    values = arguments.sector_filter_grid or [SECTOR_FILTER_OFF]
+    return tuple(value == SECTOR_FILTER_ON for value in values)
+
+
+def needs_reference_series(arguments: argparse.Namespace) -> bool:
+    return uses_signal_filters(arguments) or True in sector_filter_grid(arguments)
+
+
+def build_sector_filter(settings: ApplicationSettings) -> SectorRotationFilter:
+    """Filtro de fuerza relativa sectorial con la configuración `signals`."""
+    signals = settings.signals
+    return SectorRotationFilter(
+        benchmark=signals.benchmark,
+        sector_map=signals.sector_map,
+        sector_etfs=signals.sector_etfs,
+        lookback=signals.relative_strength_lookback,
+        top_k=signals.sector_top_k,
+        allow_unmapped=signals.sector_allow_unmapped,
+    )
 
 
 def uses_signal_filters(arguments: argparse.Namespace) -> bool:
@@ -316,16 +356,7 @@ def build_signal_generator(
     labels: list[str] = []
 
     if arguments.use_sector_relative_strength:
-        filters.append(
-            SectorRotationFilter(
-                benchmark=signals.benchmark,
-                sector_map=signals.sector_map,
-                sector_etfs=signals.sector_etfs,
-                lookback=signals.relative_strength_lookback,
-                top_k=signals.sector_top_k,
-                allow_unmapped=signals.sector_allow_unmapped,
-            )
-        )
+        filters.append(build_sector_filter(settings))
         labels.append("sector_rs")
 
     if arguments.vix_filter_threshold is not None:
@@ -412,7 +443,7 @@ def build_request(
         include_dividends=not arguments.no_dividends,
         reference_symbols=(
             settings.universe(settings.signals.reference_universe)
-            if uses_signal_filters(arguments)
+            if needs_reference_series(arguments)
             else ()
         ),
     )
@@ -452,6 +483,7 @@ def build_grid(
         max_position_exposures=tuple(arguments.exposures),
         max_positions=tuple(arguments.positions_grid or (risk.max_positions,)),
         risk_per_trade=tuple(arguments.risk_grid or (risk.risk_per_trade,)),
+        use_sector_filter=sector_filter_grid(arguments),
     )
 
 
@@ -530,7 +562,12 @@ def run_walk_forward_command(
     settings: ApplicationSettings,
     calendar: TradingCalendar | None,
 ) -> tuple[WalkForwardReport, Path, Path]:
-    """Carga los datos una vez de MySQL y ejecuta el walk-forward en memoria."""
+    """
+    Carga los datos una vez de MySQL y ejecuta el walk-forward en memoria.
+
+    Con el filtro sectorial en la rejilla, las series de referencia se leen
+    en la misma carga y el analizador las reutiliza en todas las ventanas.
+    """
     request = build_request(arguments, settings)
     config = WalkForwardConfig(
         in_sample_months=arguments.is_months,
@@ -549,6 +586,12 @@ def run_walk_forward_command(
         dividends_by_symbol=data.dividends_by_symbol,
         trading_sessions=data.trading_sessions,
         trading_calendar=calendar.name if calendar is not None else None,
+        reference_bars=data.reference_bars,
+        sector_filter=(
+            build_sector_filter(settings)
+            if config.grid.includes_sector_filter
+            else None
+        ),
     ).run(
         request.parameters,
         config,
@@ -696,6 +739,7 @@ def format_walk_forward_summary(
             f"Buy & Hold OOS: {_pct(benchmark_return)}  "
             f"Exceso de la estrategia: {_pct(excess_return)}",
             *_scaling_lines(report),
+            *_sector_filter_lines(report),
             f"Informe JSON: {json_path}",
             f"Informe Markdown: {markdown_path}",
         ]
@@ -800,6 +844,26 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     print(format_summary(outcome, json_path, markdown_path))
     return 0
+
+
+def _sector_filter_lines(report: WalkForwardReport) -> list[str]:
+    if not report.sector_filter_study:
+        return []
+
+    lines = [
+        f"Filtro sectorial elegido en {report.sector_filter_selections} de "
+        f"{len(report.windows)} ventanas IS; señales bloqueadas "
+        f"{report.sector_filter_blocked_signals}"
+    ]
+    lines.extend(
+        f"  {'con' if study.use_sector_filter else 'sin'} filtro: retorno OOS "
+        f"{_pct(study.out_of_sample.cumulative_return)}  "
+        f"MDD {_pct(study.out_of_sample.max_drawdown_pct)}  "
+        f"PF {_ratio(study.out_of_sample.profit_factor)}  "
+        f"WFE {_pct(study.walk_forward_efficiency)}"
+        for study in report.sector_filter_study
+    )
+    return lines
 
 
 def _or_default(value: Decimal | None, default: Decimal) -> Decimal:

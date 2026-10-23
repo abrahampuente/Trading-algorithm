@@ -20,6 +20,13 @@ Garantías contra el sesgo:
   datos, por lo que los indicadores son idénticos en todas las ventanas.
 - Las posiciones abiertas al final de una ventana se cierran al último cierre
   de la ventana (`END_OF_DATA`), de modo que cada ventana es independiente.
+
+Con el eje `use_sector_filter` de la rejilla, la selección IS decide también
+si aplicar el filtro v2 de fuerza relativa sectorial. Las series de referencia
+(benchmark y ETFs sectoriales) se reciben una vez en memoria y las señales
+filtradas se calculan una sola vez sobre todo el historial: el filtro sólo ve
+`SignalContext.until(t)`, así que son invariantes a barras futuras y válidas
+para cualquier ventana.
 """
 
 import calendar
@@ -51,7 +58,15 @@ from algo_trading.backtesting.sensitivity import (
 )
 from algo_trading.domain.corporate_actions.dto import CorporateDividend
 from algo_trading.execution.trade import Trade
+from algo_trading.indicators.price_series import PriceBar
 from algo_trading.portfolio.position_sizing import MONEY_PRECISION, MONEY_ROUNDING
+from algo_trading.signals import (
+    CompositeSignalGenerator,
+    MomentumBreakoutGenerator,
+    SectorRotationFilter,
+    SignalContext,
+    long_signal_from_signal,
+)
 from algo_trading.strategy.long_signal import (
     LongSignal,
     LongSignalGenerator,
@@ -138,6 +153,7 @@ class PeriodEvaluation(BaseModel):
     max_position_exposure: Decimal
     max_positions: int = 5
     risk_per_trade: Decimal = Decimal("0.005")
+    use_sector_filter: bool = False
     initial_equity: Decimal
     final_equity: Decimal
     cumulative_return: Decimal
@@ -159,6 +175,7 @@ class PeriodEvaluation(BaseModel):
             max_position_exposure=self.max_position_exposure,
             max_positions=self.max_positions,
             risk_per_trade=self.risk_per_trade,
+            use_sector_filter=self.use_sector_filter,
         )
 
 
@@ -197,10 +214,29 @@ class PortfolioScaleResult(BaseModel):
         return self.max_positions * self.risk_per_trade
 
 
+class SectorFilterStudyResult(BaseModel):
+    """
+    Walk-forward restringido a usar (o no) el filtro sectorial.
+
+    En cada IS sólo compiten las combinaciones con ese valor del filtro (el
+    resto de ejes sigue optimizándose); su OOS se encadena igual que el
+    walk-forward principal.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    use_sector_filter: bool
+    selected: tuple[PeriodEvaluation, ...]
+    out_of_sample_by_window: tuple[PeriodEvaluation, ...]
+    out_of_sample: PeriodEvaluation
+    mean_in_sample_annualized_return: Decimal | None
+    walk_forward_efficiency: Decimal | None
+
+
 class WalkForwardReport(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    report_version: str = "walk-forward-report-v3"
+    report_version: str = "walk-forward-report-v4"
     universe: str | None = None
     symbols: tuple[str, ...]
     trading_calendar: str | None
@@ -214,6 +250,14 @@ class WalkForwardReport(BaseModel):
     walk_forward_efficiency: Decimal | None
     buy_and_hold: BuyAndHoldComparison | None = None
     scaling_study: tuple[PortfolioScaleResult, ...] = ()
+    sector_filter: SectorRotationFilter | None = None
+    sector_filter_blocked_signals: int | None = None
+    sector_filter_study: tuple[SectorFilterStudyResult, ...] = ()
+
+    @property
+    def sector_filter_selections(self) -> int:
+        """Ventanas cuya selección IS eligió el filtro sectorial."""
+        return sum(1 for result in self.windows if result.selected.use_sector_filter)
 
     @property
     def is_robust(self) -> bool | None:
@@ -375,6 +419,9 @@ class WalkForwardAnalyzer:
 
     `bars_by_symbol` debe contener el historial completo desde el inicio del
     análisis; cada ventana usa sólo las barras hasta su fin.
+
+    `reference_bars` (benchmark y ETFs sectoriales) y `sector_filter` son
+    necesarios si la rejilla incluye `use_sector_filter = True`.
     """
 
     def __init__(
@@ -383,6 +430,8 @@ class WalkForwardAnalyzer:
         dividends_by_symbol: Mapping[str, Sequence[CorporateDividend]] | None = None,
         trading_sessions: Sequence[date] | None = None,
         trading_calendar: str | None = None,
+        reference_bars: Mapping[str, Sequence[PriceBar]] | None = None,
+        sector_filter: SectorRotationFilter | None = None,
     ) -> None:
         if not bars_by_symbol:
             raise ValueError("No hay barras para el walk-forward")
@@ -394,25 +443,59 @@ class WalkForwardAnalyzer:
         }
         self._sessions = tuple(trading_sessions) if trading_sessions else None
         self._calendar_name = trading_calendar
-        self._signals: dict[SignalParameters, dict[str, tuple[LongSignal, ...]]] = {}
+        self._context = SignalContext(reference_bars)
+        self._sector_filter = sector_filter
+        self._signals: dict[
+            tuple[SignalParameters, bool], dict[str, tuple[LongSignal, ...]]
+        ] = {}
+        self._blocked_signals: dict[SignalParameters, int] = {}
 
     def signals(
         self,
         parameters: SignalParameters,
+        use_sector_filter: bool = False,
     ) -> dict[str, tuple[LongSignal, ...]]:
         """
-        Señales de todo el historial, calculadas una vez por parámetros.
+        Señales de todo el historial, calculadas una vez por parámetros y uso
+        del filtro sectorial.
 
         Son invariantes a barras futuras, así que valen para cualquier
         ventana: el motor sólo usa las de barras hasta el fin de la ventana.
         """
-        if parameters not in self._signals:
+        key = (parameters, use_sector_filter)
+
+        if key in self._signals:
+            return self._signals[key]
+
+        if not use_sector_filter:
             generator = LongSignalGenerator(parameters)
-            self._signals[parameters] = {
+            self._signals[key] = {
                 symbol: generator.generate(bars) for symbol, bars in self._bars.items()
             }
+            return self._signals[key]
 
-        return self._signals[parameters]
+        if self._sector_filter is None:
+            raise ValueError(
+                "La rejilla usa el filtro sectorial pero no se configuró sector_filter"
+            )
+
+        composite = CompositeSignalGenerator(
+            MomentumBreakoutGenerator(parameters),
+            filters=[self._sector_filter],
+        )
+        signals: dict[str, tuple[LongSignal, ...]] = {}
+        blocked = 0
+
+        for symbol, bars in self._bars.items():
+            outcome = composite.run(bars, self._context)
+            signals[symbol] = tuple(
+                long_signal_from_signal(signal) for signal in outcome.accepted
+            )
+            blocked += len(outcome.filtered)
+
+        self._signals[key] = signals
+        self._blocked_signals[parameters] = blocked
+        return signals
 
     @property
     def data_start(self) -> date:
@@ -427,6 +510,7 @@ class WalkForwardAnalyzer:
         parameters: BacktestParameters,
         start: date,
         end: date,
+        use_sector_filter: bool = False,
     ) -> tuple[PeriodEvaluation, tuple[Trade, ...], tuple[EquityPoint, ...]]:
         """Backtest con entradas sólo en [start, end] y datos hasta `end`."""
         bars = {
@@ -449,7 +533,7 @@ class WalkForwardAnalyzer:
             trading_sessions=sessions,
             dividends_by_symbol=dividends,
             trading_start=start,
-            precomputed_signals=self.signals(parameters.signal),
+            precomputed_signals=self.signals(parameters.signal, use_sector_filter),
         )
         initial_equity = parameters.initial_cash
 
@@ -467,6 +551,7 @@ class WalkForwardAnalyzer:
             max_position_exposure=parameters.risk.max_position_exposure,
             max_positions=parameters.risk.max_positions,
             risk_per_trade=parameters.risk.risk_per_trade,
+            use_sector_filter=use_sector_filter,
             initial_equity=initial_equity,
             final_equity=result.final_cash,
             cumulative_return=cumulative_return,
@@ -541,6 +626,7 @@ class WalkForwardAnalyzer:
                     combination.apply(base_parameters),
                     window.in_sample_start,
                     window.in_sample_end,
+                    use_sector_filter=combination.use_sector_filter,
                 )[0]
                 for combination in config.grid.combinations()
             )
@@ -598,6 +684,45 @@ class WalkForwardAnalyzer:
                     )
                 )
 
+        sector_filter_study: list[SectorFilterStudyResult] = []
+
+        if len(config.grid.use_sector_filter) > 1:
+            for use_sector_filter in config.grid.use_sector_filter:
+                filter_chain = self._chain_out_of_sample(
+                    base_parameters,
+                    config,
+                    windows,
+                    {
+                        index: tuple(
+                            evaluation
+                            for evaluation in evaluations
+                            if evaluation.use_sector_filter is use_sector_filter
+                        )
+                        for index, evaluations in in_sample_by_window.items()
+                    },
+                    include_benchmark=False,
+                )
+                filter_oos, filter_mean_is, filter_efficiency = self._summarize(
+                    base_parameters,
+                    windows,
+                    filter_chain,
+                    analysis_end,
+                )
+                sector_filter_study.append(
+                    SectorFilterStudyResult(
+                        use_sector_filter=use_sector_filter,
+                        selected=tuple(r.selected for r in filter_chain.results),
+                        out_of_sample_by_window=tuple(
+                            r.out_of_sample for r in filter_chain.results
+                        ),
+                        out_of_sample=filter_oos,
+                        mean_in_sample_annualized_return=filter_mean_is,
+                        walk_forward_efficiency=filter_efficiency,
+                    )
+                )
+
+        uses_sector_filter = config.grid.includes_sector_filter
+
         return WalkForwardReport(
             universe=universe,
             symbols=tuple(sorted(self._bars)),
@@ -617,6 +742,13 @@ class WalkForwardAnalyzer:
                 out_of_sample.cumulative_return,
             ),
             scaling_study=tuple(scaling_study),
+            sector_filter=self._sector_filter if uses_sector_filter else None,
+            sector_filter_blocked_signals=(
+                self._blocked_signals.get(base_parameters.signal)
+                if uses_sector_filter
+                else None
+            ),
+            sector_filter_study=tuple(sector_filter_study),
         )
 
     def _chain_out_of_sample(
@@ -646,6 +778,7 @@ class WalkForwardAnalyzer:
                 ),
                 window.out_of_sample_start,
                 window.out_of_sample_end,
+                use_sector_filter=selected.use_sector_filter,
             )
             benchmark = (
                 self.buy_and_hold(
@@ -719,6 +852,7 @@ class WalkForwardAnalyzer:
             max_position_exposure=last_selected.max_position_exposure,
             max_positions=last_selected.max_positions,
             risk_per_trade=last_selected.risk_per_trade,
+            use_sector_filter=last_selected.use_sector_filter,
             initial_equity=initial_equity,
             final_equity=chain.final_equity,
             cumulative_return=cumulative,
@@ -789,6 +923,8 @@ def walk_forward_to_markdown(report: WalkForwardReport) -> str:
         + ", ".join(str(value) for value in config.grid.max_positions)
         + "; riesgo "
         + ", ".join(_pct(value) for value in config.grid.risk_per_trade)
+        + "; filtro sectorial "
+        + ", ".join(_yes_no(value) for value in config.grid.use_sector_filter)
         + f" ({len(config.grid.combinations())} combinaciones)",
         f"- Perfil de costes: {parameters.cost_profile or NOT_AVAILABLE}; anti-gap "
         f"{parameters.gap_threshold_atr} × ATR",
@@ -870,6 +1006,9 @@ def walk_forward_to_markdown(report: WalkForwardReport) -> str:
     if report.scaling_study:
         lines.extend(_scaling_section(report))
 
+    if report.sector_filter_study:
+        lines.extend(_sector_filter_section(report))
+
     lines.extend(["", "## Rejilla In-Sample por ventana", ""])
 
     for result in report.windows:
@@ -879,16 +1018,17 @@ def walk_forward_to_markdown(report: WalkForwardReport) -> str:
                 f"### Ventana {window.index}: IS {window.in_sample_start} → "
                 f"{window.in_sample_end}",
                 "",
-                "| SL × ATR | TP × ATR | Exposición | Posiciones | Riesgo | Retorno "
+                "| SL × ATR | TP × ATR | Exposición | Posiciones | Riesgo "
+                "| Filtro sectorial | Retorno "
                 "| Anualizado | MDD | PF | Sharpe | Win Rate | Trades | Elegida |",
-                "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: "
-                "| ---: | ---: | ---: | :---: |",
+                "| ---: | ---: | ---: | ---: | ---: | :---: | ---: | ---: | ---: "
+                "| ---: | ---: | ---: | ---: | :---: |",
             ]
         )
         lines.extend(
             f"| {e.stop_loss_atr_multiple} | {e.take_profit_atr_multiple} "
             f"| {_pct(e.max_position_exposure)} | {e.max_positions} "
-            f"| {_pct(e.risk_per_trade)} "
+            f"| {_pct(e.risk_per_trade)} | {_yes_no(e.use_sector_filter)} "
             f"| {_pct(e.cumulative_return)} | {_pct(e.annualized_return)} "
             f"| {_pct(e.max_drawdown_pct)} | {_ratio(e.profit_factor)} "
             f"| {_ratio(e.sharpe_ratio)} | {_pct(e.win_rate)} | {e.total_trades} "
@@ -997,6 +1137,113 @@ def _scaling_section(report: WalkForwardReport) -> list[str]:
         f"riesgo {_pct(best_sharpe.risk_per_trade)} "
         f"(Sharpe {_ratio(best_sharpe.out_of_sample.sharpe_ratio)}).",
     ]
+
+
+def _sector_filter_section(report: WalkForwardReport) -> list[str]:
+    """Filtro sectorial: frecuencia de selección IS e impacto OOS."""
+    total = len(report.windows)
+    chosen = report.sector_filter_selections
+    sector_filter = report.sector_filter
+    by_flag = {study.use_sector_filter: study for study in report.sector_filter_study}
+    lines = [
+        "",
+        "## Filtro de fuerza relativa sectorial",
+        "",
+    ]
+
+    if sector_filter is not None:
+        lines.extend(
+            [
+                f"- Filtro: `{sector_filter.name}`, ETF del sector entre los "
+                f"{sector_filter.top_k} de mayor fuerza relativa a "
+                f"{sector_filter.lookback} sesiones; símbolos sin sector "
+                + ("admitidos" if sector_filter.allow_unmapped else "bloqueados")
+                + ".",
+                "- Señales v1 bloqueadas por el filtro en todo el historial: "
+                f"{report.sector_filter_blocked_signals}.",
+            ]
+        )
+
+    lines.extend(
+        [
+            f"- La selección IS eligió el filtro en **{chosen} de {total}** "
+            f"ventanas ({_pct(Decimal(chosen) / total if total else None)}).",
+            "",
+            "Cada fila restringida es un walk-forward completo en el que sólo "
+            "compiten las combinaciones con o sin filtro (SL, TP, exposición y "
+            "escala se siguen optimizando en cada IS). La fila optimizada deja "
+            "que la selección IS elija también el filtro.",
+            "",
+            "| Variante | Retorno OOS | Anual. OOS | MDD OOS | PF | Sharpe "
+            "| Win Rate | Exposición media | Trades | WFE |",
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        ]
+    )
+
+    def row(label: str, oos: PeriodEvaluation, efficiency: Decimal | None) -> str:
+        return (
+            f"| {label} | {_pct(oos.cumulative_return)} "
+            f"| {_pct(oos.annualized_return)} | {_pct(oos.max_drawdown_pct)} "
+            f"| {_ratio(oos.profit_factor)} | {_ratio(oos.sharpe_ratio)} "
+            f"| {_pct(oos.win_rate)} | {_pct(oos.average_exposure)} "
+            f"| {oos.total_trades} | {_pct(efficiency)} |"
+        )
+
+    labels = {False: "Sin filtro (señal v1)", True: "Con filtro sectorial"}
+    lines.extend(
+        row(
+            labels[study.use_sector_filter],
+            study.out_of_sample,
+            study.walk_forward_efficiency,
+        )
+        for study in report.sector_filter_study
+    )
+    lines.append(
+        row(
+            "**Optimizado (IS elige)**",
+            report.out_of_sample,
+            report.walk_forward_efficiency,
+        )
+    )
+
+    if False in by_flag and True in by_flag:
+        base = by_flag[False]
+        filtered = by_flag[True]
+        lines.extend(
+            [
+                "",
+                "### Por ventana",
+                "",
+                "| # | OOS | Elegido | PF IS sin filtro | PF IS con filtro "
+                "| Retorno OOS sin filtro | Retorno OOS con filtro "
+                "| MDD OOS sin filtro | MDD OOS con filtro |",
+                "| ---: | --- | :---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+            ]
+        )
+        lines.extend(
+            f"| {result.window.index} | {result.window.out_of_sample_start} → "
+            f"{result.window.out_of_sample_end} "
+            f"| {'filtro' if result.selected.use_sector_filter else 'base'} "
+            f"| {_ratio(base_is.profit_factor)} | {_ratio(filtered_is.profit_factor)} "
+            f"| {_pct(base_oos.cumulative_return)} "
+            f"| {_pct(filtered_oos.cumulative_return)} "
+            f"| {_pct(base_oos.max_drawdown_pct)} "
+            f"| {_pct(filtered_oos.max_drawdown_pct)} |"
+            for result, base_is, filtered_is, base_oos, filtered_oos in zip(
+                report.windows,
+                base.selected,
+                filtered.selected,
+                base.out_of_sample_by_window,
+                filtered.out_of_sample_by_window,
+                strict=True,
+            )
+        )
+
+    return lines
+
+
+def _yes_no(value: bool) -> str:
+    return "sí" if value else "no"
 
 
 def _average_open_positions(curve: Sequence[EquityPoint]) -> Decimal | None:
