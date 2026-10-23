@@ -87,6 +87,16 @@ intraday:
   max_delay_seconds: 60
   price_tolerance: 0.01      # margen sobre el rango diario antes del fallback
 
+# Broker de paper trading v2 (Hito 3). Sólo Alpaca Paper: además de esta URL,
+# ALPACA_PAPER=true es obligatorio en .env antes de enviar cualquier orden.
+broker:
+  name: alpaca
+  environment: paper
+  base_url: https://paper-api.alpaca.markets
+  timeout_seconds: 30
+  max_attempts: 3
+  gap_threshold_atr: 0.5       # límite de la compra OPG: Close + 0.5 x ATR
+
 # Filtros de régimen v2 (desactivados por defecto; se activan desde la CLI con
 # --use-sector-relative-strength y --vix-filter-threshold).
 signals:

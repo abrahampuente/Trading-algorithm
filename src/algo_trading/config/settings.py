@@ -132,6 +132,23 @@ class IntradaySettings(BaseModel):
     price_tolerance: Decimal = Field(default=Decimal("0.01"), ge=0)
 
 
+class BrokerSettings(BaseModel):
+    """
+    Broker de paper trading (Hito 3). La v2 sólo admite Alpaca Paper: la URL
+    no es configurable a otra cosa y `ALPACA_PAPER=true` es obligatorio en el
+    entorno (`PaperTradingGuard`).
+    """
+
+    name: Literal["alpaca"] = "alpaca"
+    environment: Literal["paper"] = "paper"
+    base_url: Literal["https://paper-api.alpaca.markets"] = (
+        "https://paper-api.alpaca.markets"
+    )
+    timeout_seconds: float = Field(default=30.0, gt=0)
+    max_attempts: int = Field(default=3, ge=1)
+    gap_threshold_atr: Decimal = Field(default=Decimal("0.5"), ge=0)
+
+
 class DatabaseSettings(BaseModel):
     host: str
     port: int = Field(gt=0, le=65535)
@@ -169,6 +186,7 @@ class ApplicationSettings(BaseSettings):
     strategy: StrategySettings = Field(default_factory=StrategySettings)
     signals: SignalSettings = Field(default_factory=SignalSettings)
     intraday: IntradaySettings = Field(default_factory=IntradaySettings)
+    broker: BrokerSettings = Field(default_factory=BrokerSettings)
 
     @model_validator(mode="after")
     def validate_default_universe(self) -> "ApplicationSettings":
@@ -189,6 +207,8 @@ class ApplicationSettings(BaseSettings):
         default=None,
         validation_alias=AliasChoices("alpaca_api_secret_key", "alpaca_secret_key"),
     )
+    # Texto, no bool: PaperTradingGuard sólo acepta el valor exacto "true".
+    alpaca_paper: str | None = None
 
     @classmethod
     def from_yaml(

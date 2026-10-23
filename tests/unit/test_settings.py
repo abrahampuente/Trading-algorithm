@@ -116,3 +116,17 @@ def test_local_settings_define_intraday_provider_without_secrets() -> None:
     assert "alpaca_api_secret_key" not in yaml.safe_load(
         LOCAL_CONFIG_PATH.read_text(encoding="utf-8")
     )
+
+
+def test_broker_settings_only_allow_alpaca_paper() -> None:
+    broker = ApplicationSettings.from_yaml().broker
+
+    assert (broker.name, broker.environment) == ("alpaca", "paper")
+    assert broker.base_url == "https://paper-api.alpaca.markets"
+    assert broker.gap_threshold_atr == Decimal("0.5")
+
+    with pytest.raises(ValueError):
+        type(broker).model_validate({"base_url": "https://api.alpaca.markets"})
+
+    with pytest.raises(ValueError):
+        type(broker).model_validate({"environment": "live"})

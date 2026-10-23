@@ -185,6 +185,34 @@ SL × ATR  TP × ATR  Trades  Conflictos  Necesitan datos intradía
 
 Hito 2 cerrado en cuanto a datos intradía y resolución intrabarra. Pendiente (pasa a trabajos posteriores): persistir las barras de 1 minuto descargadas como snapshots (`market_bars_raw`, timeframe `1m`); correlación de cartera y costes dinámicos (más relevantes para la v1 que la resolución intrabarra, a la vista de los conflictos).
 
+### Hito 3 (en curso): conector de órdenes Alpaca Paper
+
+Núcleo completado: conector `AlpacaPaperBroker`, guardia estricta de paper trading y `OrderPlanner`. Módulos nuevos en `execution/` (todavía no los usa ningún pipeline ni la CLI; verificados sólo con respuestas simuladas, sin órdenes reales enviadas):
+
+- `orders.py`: `OrderRequest` (validada: limitada con precio, stop con stop, mercado sin precios, `OPG` sólo mercado o limitada, OCO = venta limitada con TP > SL y `day` / `gtc`), `OrderState` (con patas `legs`), `OrderStatus` normalizado (`SUBMITTED`, `PARTIALLY_FILLED`, `FILLED`, `CANCELED`, `EXPIRED`, `REJECTED`, `REPLACED`) a partir de los estados de Alpaca (los transitorios como `pending_new`, `accepted`, `pending_cancel` o `done_for_day` cuentan como `SUBMITTED`), `validate_transition` y `OrderBook`, registro local que rechaza transiciones imposibles (p. ej. `FILLED → SUBMITTED`) o cantidades ejecutadas que bajan, y emite un `OrderEvent` por cambio. `round_to_tick` aplica los ticks de Alpaca (0,01 desde 1 USD, 0,0001 por debajo) con redondeo explícito.
+- `broker.py`: contrato `BrokerAdapter` (cuenta, posiciones, enviar, consultar por `client_order_id`, órdenes abiertas, cancelar), `AccountSnapshot`, `BrokerPosition`.
+- `alpaca_broker.py`: `AlpacaPaperBroker` (`/v2/account`, `/v2/positions`, `/v2/orders`, `/v2/orders:by_client_order_id`, `DELETE /v2/orders/{id}`), sólo librería estándar con transporte inyectable.
+- `order_planner.py`: `OrderPlanner` de `PlannedEntry` (salida del `PortfolioAllocator`) a órdenes:
+  - Entrada: compra limitada `OPG` con `límite = Close[t] + 0,5 × ATR[t]` redondeado hacia abajo: el escudo anti-gap de la v1 lo aplica el broker (si la apertura supera el límite, la orden no se ejecuta y termina `CANCELED` / `EXPIRED`, el equivalente a `GAP_FILTERED`).
+  - SL / TP: OCO `GTC` tras la ejecución de la entrada (Alpaca no admite bracket con `OPG`), con los niveles recalculados sobre el precio medio ejecutado y el ATR congelado de la señal; SL y TP redondeados hacia arriba (stop algo más alto: pérdida nunca mayor que la planificada).
+  - Salida temporal: venta a mercado `OPG`.
+  - `client_order_id = algo-<intención>-<símbolo>-<AAAAMMDD>-<hash>`, determinista: reenviar el plan de una sesión no duplica órdenes.
+
+Seguridad (`PaperTradingGuard`), comprobada al crear el broker y antes de cada orden o cancelación; si falla, `LiveTradingNotAllowedError` y no se envía nada:
+
+1. `ALPACA_PAPER` con el valor exacto `true` (sin distinguir mayúsculas). Ausente, vacío, `false`, `1`, `yes`… son fatales. Se lee como texto para que pydantic no acepte `1` o `yes` como verdadero.
+2. URL base exactamente `https://paper-api.alpaca.markets` (también fijada por tipo en `BrokerSettings`).
+3. Clave de paper (`PK…`).
+4. Cuenta de paper (`account_number` `PA…`), verificada con `GET /v2/account` antes de la primera orden.
+5. 401 / 403 del broker también son fatales.
+
+Envío idempotente: ante error de red o 5xx en el `POST` se consulta la orden por `client_order_id` antes de reenviar (la orden pudo llegar); 429 se reintenta con backoff; 4xx (p. ej. 422 por poder de compra) se rechaza sin reintento.
+
+Configuración: sección `broker` en `local.yaml` (`BrokerSettings`) y `ALPACA_PAPER=true` en `.env` (añadido a `.env.example`); `build_alpaca_paper_broker(settings)`.
+
+Pendiente en el Hito 3: persistencia de órdenes, eventos y fills (migración); reconciliación con las posiciones del broker; primer ciclo manual en la cuenta paper (envío, fill, OCO, cancelación).
+
+
 ## v1 cerrada (2026-10-23)
 
 La v1 (backtesting diario, sin órdenes reales) queda cerrada con estos valores por defecto, definidos en `configs/environments/local.yaml` y usados por `algo-ingest` y `algo-backtest` cuando no se indican argumentos:
