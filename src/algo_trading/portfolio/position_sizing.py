@@ -16,6 +16,8 @@ class RiskParameters(BaseModel):
     max_position_exposure: Decimal = Field(default=Decimal("0.10"), gt=0, le=1)
     max_positions: int = Field(default=5, ge=1)
     commission_rate: Decimal = Field(default=Decimal("0"), ge=0, lt=1)
+    stop_loss_atr_multiple: Decimal = Field(default=Decimal("1"), gt=0)
+    take_profit_atr_multiple: Decimal = Field(default=Decimal("2"), gt=0)
 
 
 class SizingLimit(StrEnum):

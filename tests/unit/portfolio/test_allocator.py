@@ -8,7 +8,9 @@ from algo_trading.portfolio import (
     PortfolioAllocator,
     PortfolioState,
     Position,
+    PositionSizer,
     RejectionReason,
+    RiskParameters,
     prioritize_candidates,
 )
 from algo_trading.strategy import LongSignal
@@ -224,3 +226,17 @@ def test_rejects_duplicate_candidates_for_same_symbol() -> None:
 
     with pytest.raises(ValueError, match="un candidato por símbolo"):
         PortfolioAllocator().allocate(candidates, PortfolioState(cash=Decimal("1")))
+
+
+def test_stop_loss_multiple_widens_stop_and_reduces_risk_quantity() -> None:
+    state = PortfolioState(cash=Decimal("100000"))
+    candidate = build_candidate("AAA", momentum="0.10")
+    sizer = PositionSizer(RiskParameters(stop_loss_atr_multiple=Decimal("2")))
+
+    result = PortfolioAllocator(sizer).allocate([candidate], state)
+
+    entry = result.accepted[0]
+    # Entrada 50, ATR 5: SL = 50 - 2 x 5 = 40; riesgo 500 / 10 = 50 unidades.
+    assert entry.exit_levels.stop_loss == Decimal("40")
+    assert entry.exit_levels.take_profit == Decimal("60")
+    assert entry.sizing.quantity == 50

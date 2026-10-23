@@ -52,6 +52,7 @@ class BacktestParameters(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     initial_cash: Decimal = Field(gt=0)
+    cost_profile: str | None = Field(default=None, max_length=32)
     signal: SignalParameters = SignalParameters()
     risk: RiskParameters = RiskParameters(commission_rate=Decimal("0.0005"))
     costs: CostModel = CostModel()

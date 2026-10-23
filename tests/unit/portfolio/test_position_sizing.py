@@ -229,3 +229,33 @@ def test_long_exit_levels_use_frozen_entry_atr() -> None:
 def test_long_exit_levels_reject_non_positive_atr() -> None:
     with pytest.raises(ValueError, match="entry_atr"):
         calculate_long_exit_levels(entry_price=Decimal("50"), entry_atr=Decimal("0"))
+
+
+def test_long_exit_levels_scale_stop_with_atr_multiple() -> None:
+    levels = calculate_long_exit_levels(
+        entry_price=Decimal("50"),
+        entry_atr=Decimal("2"),
+        stop_loss_atr_multiple=Decimal("1.5"),
+    )
+
+    assert levels.stop_loss == Decimal("47.0")
+    # El TP no cambia: 2 x ATR.
+    assert levels.take_profit == Decimal("54")
+    assert levels.stop_loss_atr_multiple == Decimal("1.5")
+    assert levels.take_profit_atr_multiple == Decimal("2")
+
+
+def test_long_exit_levels_reject_non_positive_multiples() -> None:
+    with pytest.raises(ValueError, match="stop_loss_atr_multiple"):
+        calculate_long_exit_levels(
+            entry_price=Decimal("50"),
+            entry_atr=Decimal("2"),
+            stop_loss_atr_multiple=Decimal("0"),
+        )
+
+
+def test_risk_parameters_default_to_v1_exit_multiples() -> None:
+    parameters = RiskParameters()
+
+    assert parameters.stop_loss_atr_multiple == Decimal("1")
+    assert parameters.take_profit_atr_multiple == Decimal("2")

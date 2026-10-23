@@ -30,6 +30,7 @@ class BacktestRunMetadata(BaseModel):
     adjustment_version: str
     start_date: date
     end_date: date
+    sweep_id: str | None = None
 
 
 class BacktestRunSummary(BaseModel):
@@ -40,6 +41,7 @@ class BacktestRunSummary(BaseModel):
     run_id: str
     created_at: datetime
     report_checksum: str
+    sweep_id: str | None
     symbols: tuple[str, ...]
     start_date: date
     end_date: date
@@ -86,6 +88,7 @@ class BacktestRunRepository:
             created_at=_naive_utc(metadata.created_at),
             report_version=report.report_version,
             report_checksum=metadata.report_checksum,
+            sweep_id=metadata.sweep_id,
             symbols=",".join(report.symbols),
             start_date=metadata.start_date,
             end_date=metadata.end_date,
@@ -179,13 +182,21 @@ class BacktestRunRepository:
         run = self._session.get(BacktestRunModel, run_id)
         return _to_summary(run) if run is not None else None
 
-    def list_summaries(self, limit: int = 20) -> tuple[BacktestRunSummary, ...]:
-        """Ejecuciones más recientes primero."""
-        statement = (
-            select(BacktestRunModel)
-            .order_by(BacktestRunModel.created_at.desc(), BacktestRunModel.run_id)
-            .limit(limit)
-        )
+    def list_summaries(
+        self,
+        limit: int = 20,
+        sweep_id: str | None = None,
+    ) -> tuple[BacktestRunSummary, ...]:
+        """Ejecuciones más recientes primero; opcionalmente de un barrido."""
+        statement = select(BacktestRunModel)
+
+        if sweep_id is not None:
+            statement = statement.where(BacktestRunModel.sweep_id == sweep_id)
+
+        statement = statement.order_by(
+            BacktestRunModel.created_at.desc(),
+            BacktestRunModel.run_id,
+        ).limit(limit)
         return tuple(_to_summary(run) for run in self._session.scalars(statement))
 
     def get_trades(self, run_id: str) -> Sequence[BacktestTradeModel]:
@@ -210,6 +221,7 @@ def _to_summary(run: BacktestRunModel) -> BacktestRunSummary:
         run_id=run.run_id,
         created_at=run.created_at.replace(tzinfo=UTC),
         report_checksum=run.report_checksum,
+        sweep_id=run.sweep_id,
         symbols=tuple(run.symbols.split(",")),
         start_date=run.start_date,
         end_date=run.end_date,

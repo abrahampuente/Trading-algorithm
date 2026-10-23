@@ -113,11 +113,14 @@ Comisión base: 0,05 %
 Slippage base: 0,05 %
 ```
 
-Se conservarán perfiles:
+Perfiles definidos en `configs/environments/local.yaml` (`cost_profiles`) y seleccionables con `algo-backtest --cost-profile`:
 
-- Optimista.
-- Base.
-- Conservador.
+```text
+Perfil        Comisión   Slippage
+optimista     0,02 %     0,02 %
+base          0,05 %     0,05 %   (por defecto)
+conservador   0,10 %     0,10 %
+```
 
 En compras:
 
@@ -632,6 +635,54 @@ run (gap)     Retorno   MDD     Trades  PF    Dividendos  B&H       MDD B&H  Div
 
 El calendario no cambió los trades (las series ya cubrían todas las sesiones). Relajar el anti-gap a 1.0 añade 13 operaciones y empeora ligeramente retorno, MDD y Profit Factor.
 
+### Perfiles de costes y análisis de sensibilidad
+
+Perfiles de costes:
+
+- `ApplicationSettings.cost_profiles` (`CostProfileSettings`: `commission_rate`, `slippage_rate`) se lee de `local.yaml`; si falta la sección, se usan los tres perfiles por defecto (`default_cost_profiles`).
+- `algo-backtest --cost-profile optimista|base|conservador` (sin distinguir mayúsculas) construye el `CostModel` y fija la misma comisión en el sizing. Un perfil desconocido falla listando los disponibles.
+- El nombre del perfil queda en `BacktestParameters.cost_profile`, en el informe y en `backtest_runs.parameters`.
+
+Resultados reales (parámetros v1, 2020-01-02 → 2026-10-21):
+
+```text
+Perfil        Retorno   MDD      Trades  Win Rate  PF
+optimista     7.53 %    3.28 %   157     43.31 %   1.42
+base          5.27 %    3.41 %   158     41.77 %   1.28
+conservador   2.34 %    3.66 %   158     41.14 %   1.12
+```
+
+Multiplicador de stop loss:
+
+- `RiskParameters.stop_loss_atr_multiple` (v1: 1) y `take_profit_atr_multiple` (v1: 2). `SL = entrada - k_SL * ATR`, `TP = entrada + k_TP * ATR`; ambos quedan en `ExitLevels`.
+- El sizing usa el nuevo riesgo por unidad (`k_SL * ATR`): un stop más amplio reduce la cantidad por riesgo, de modo que el riesgo planificado sigue siendo como máximo el 0,5 % del equity.
+- CLI: `--stop-loss-atr` y `--max-position-exposure` para ejecuciones individuales.
+
+Barrido de parámetros (`backtesting/sensitivity.py`):
+
+- `ParameterGrid`: producto cartesiano de `stop_loss_atr_multiples` (por defecto 1.0, 1.5, 2.0) y `max_position_exposures` (por defecto 10 %, 15 %, 20 %). El TP se mantiene en 2 × ATR.
+- `SensitivityAnalysisService` lee barras, dividendos y sesiones una sola vez (`BacktestRunService.prepare`) y ejecuta un backtest por combinación (`run_prepared`). Con persistencia, todas las ejecuciones comparten `sweep_id` (columna nueva en `backtest_runs`, migración `a1d2e3f4b5c6`).
+- `algo-backtest --sweep [--sl-multiples ...] [--exposures ...]` imprime la tabla y escribe `reports/sensitivity_<símbolos>_<inicio>_<fin>_<perfil>.json|.md`.
+- `algo-backtest --list-runs N --sweep-id <id>` lista las ejecuciones de un barrido desde MySQL.
+
+Barrido real (perfil base, 9 combinaciones, 10,6 s):
+
+```text
+SL×ATR  Exposición  Retorno   MDD      Win Rate  PF    Expectancy R  Trades
+1.0     10 %         5.27 %   3.41 %   41.77 %   1.28  0.11          158
+1.0     15 %         7.59 %   5.09 %   41.77 %   1.27  0.11          158
+1.0     20 %         9.57 %   6.55 %   41.77 %   1.26  0.11          158
+1.5     10 %         8.00 %   2.78 %   52.94 %   1.38  0.12          153
+1.5     15 %        10.32 %   4.06 %   52.94 %   1.34  0.12          153
+1.5     20 %        10.89 %   4.78 %   52.94 %   1.30  0.12          153
+2.0     10 %        10.36 %   3.02 %   60.40 %   1.50  0.14          149
+2.0     15 %        11.54 %   3.89 %   60.40 %   1.43  0.14          149
+2.0     20 %        11.21 %   4.30 %   60.40 %   1.38  0.14          149
+Buy & Hold: 282.93 %
+```
+
+Lectura: con TP fijo en 2 × ATR, ampliar el stop sube el Win Rate y el Profit Factor; ampliar la exposición sube el retorno y el MDD casi en proporción, y a partir del 15 % la falta de cash limita las entradas. Es una optimización dentro de la muestra (un solo periodo y cinco activos muy correlacionados): antes de cambiar los parámetros v1 conviene validarla fuera de muestra (walk-forward).
+
 ### Métricas e informes (Hito 4)
 
 `calculate_performance_metrics(result, bars_by_symbol)` (`analytics/metrics.py`):
@@ -710,6 +761,8 @@ src/algo_trading/data/market_calendar.py
 src/algo_trading/persistence/models/backtest.py
 src/algo_trading/persistence/repositories/backtest_run_repository.py
 migrations/versions/9c4d5e6f7a8b_create_backtest_results.py
+migrations/versions/a1d2e3f4b5c6_add_sweep_id_to_backtest_runs.py
+src/algo_trading/backtesting/sensitivity.py
 ```
 
 ### Dominio
@@ -951,10 +1004,12 @@ Completado:
 - Calendario de mercado NYSE con validación de sesiones y conteo exacto de la salida temporal.
 - Dividendos acreditados en cash (estrategia y Buy & Hold).
 - Persistencia y comparación de ejecuciones (`backtest_runs`, `backtest_trades`, `backtest_equity_snapshots`).
+- Perfiles de costes optimista, base y conservador seleccionables desde la CLI.
+- Multiplicador de stop loss configurable y barrido de parámetros (SL × exposición) persistido con `sweep_id`.
 
 Orden inmediato:
 
-1. Perfiles de costes optimista y conservador, y análisis de sensibilidad del umbral anti-gap (barrido de parámetros persistido en `backtest_runs`).
+1. Validación fuera de muestra (walk-forward) de los parámetros del barrido antes de cambiar los valores v1; ampliar el barrido al umbral anti-gap y al TP.
 2. Reintentos con backoff para el proveedor real y validación de calidad de datos (saltos de precio, volumen cero).
 3. Decidir proveedor y granularidad intradía antes de implementar su adaptador y la simulación intradía (usando horarios y cierres tempranos del calendario).
 
@@ -973,9 +1028,9 @@ Python: 3.13.3
 Sistema operativo: Windows 11
 IDE: VS Code
 Base de datos: MySQL 8.0 mediante Docker Compose
-Estado: v1 completa en datos diarios: ingesta real, calendario NYSE, dividendos, indicadores, señales Long, gestión monetaria, backtesting persistido, métricas e informes
+Estado: v1 completa en datos diarios: ingesta real, calendario NYSE, dividendos, indicadores, señales Long, gestión monetaria, backtesting persistido, perfiles de costes, barridos de parámetros, métricas e informes
 Validaciones: pytest, ruff y mypy están en verde
-Siguiente tarea: perfiles de costes y análisis de sensibilidad del umbral anti-gap
+Siguiente tarea: validación walk-forward de los parámetros del barrido
 Fuente de verdad: docs/project-status.md
 ```
 
@@ -989,8 +1044,8 @@ ruff format --check .
 mypy src
 ```
 
-No regenerar módulos ya implementados. Continuar desde los perfiles de costes y el análisis de sensibilidad del umbral anti-gap.
+No regenerar módulos ya implementados. Continuar desde la validación walk-forward de los parámetros del barrido.
 
 Al abrir el siguiente chat, bastará con indicar:
 
-> Este proyecto continúa desde `docs/project-status.md`. Lee ese estado y no regeneres módulos ya implementados. El siguiente paso son los perfiles de costes optimista y conservador y el análisis de sensibilidad del umbral anti-gap.
+> Este proyecto continúa desde `docs/project-status.md`. Lee ese estado y no regeneres módulos ya implementados. El siguiente paso es la validación walk-forward de los parámetros del barrido (stop loss y exposición).

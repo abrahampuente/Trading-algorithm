@@ -125,6 +125,10 @@ class PortfolioAllocator:
             exit_levels = calculate_long_exit_levels(
                 entry_price=candidate.entry_price,
                 entry_atr=candidate.signal.atr,
+                stop_loss_atr_multiple=self._sizer.parameters.stop_loss_atr_multiple,
+                take_profit_atr_multiple=(
+                    self._sizer.parameters.take_profit_atr_multiple
+                ),
             )
             sizing = self._sizer.size(
                 equity=equity,

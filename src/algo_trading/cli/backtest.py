@@ -5,12 +5,19 @@ Uso:
 
     algo-backtest
     algo-backtest --symbols AAPL MSFT --start 2021-01-01 --end 2025-12-31
+    algo-backtest --cost-profile conservador --stop-loss-atr 1.5
+    algo-backtest --sweep
+    algo-backtest --sweep --sl-multiples 1 2 --exposures 0.10 0.20
     algo-backtest --list-runs 10
 
 Lee `market_bars_adjusted` y los dividendos, valida las series contra el
 calendario de mercado, ejecuta la estrategia v1, guarda la ejecución en
 MySQL (`backtest_runs`, `backtest_trades`, `backtest_equity_snapshots`) y
 escribe el informe en `<output-dir>/<name>.json` y `<output-dir>/<name>.md`.
+
+Con `--sweep` ejecuta un backtest por combinación de multiplicador de stop
+loss y exposición máxima por posición, guarda todas las ejecuciones con el
+mismo `sweep_id` y escribe una tabla comparativa.
 """
 
 import argparse
@@ -29,13 +36,26 @@ from algo_trading.backtesting.run_service import (
     BacktestRunService,
     default_report_name,
 )
+from algo_trading.backtesting.sensitivity import (
+    DEFAULT_MAX_POSITION_EXPOSURES,
+    DEFAULT_STOP_LOSS_ATR_MULTIPLES,
+    ParameterGrid,
+    SensitivityAnalysisService,
+    SensitivityReport,
+    sensitivity_table,
+    write_sensitivity_report,
+)
 from algo_trading.cli.ingest import (
     DEFAULT_ADJUSTMENT_VERSION,
     DEFAULT_START,
     DEFAULT_SYMBOLS,
     default_end_date,
 )
-from algo_trading.config.settings import PROJECT_ROOT
+from algo_trading.config.settings import (
+    DEFAULT_COST_PROFILE,
+    PROJECT_ROOT,
+    ApplicationSettings,
+)
 from algo_trading.data.market_calendar import DEFAULT_EXCHANGE, TradingCalendar
 from algo_trading.data.providers.yfinance import YFINANCE_SOURCE
 from algo_trading.execution.costs import CostModel
@@ -68,7 +88,24 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Capital inicial (por defecto: initial_capital de la configuración).",
     )
+    parser.add_argument(
+        "--cost-profile",
+        default=DEFAULT_COST_PROFILE,
+        help="Perfil de costes de la configuración: optimista, base o conservador.",
+    )
     parser.add_argument("--gap-threshold-atr", type=Decimal, default=Decimal("0.5"))
+    parser.add_argument(
+        "--stop-loss-atr",
+        type=Decimal,
+        default=Decimal("1"),
+        help="Multiplicador de ATR para el stop loss (v1: 1).",
+    )
+    parser.add_argument(
+        "--max-position-exposure",
+        type=Decimal,
+        default=Decimal("0.10"),
+        help="Exposición nominal máxima por posición (v1: 0.10).",
+    )
     parser.add_argument("--source", default=YFINANCE_SOURCE)
     parser.add_argument("--adjustment-version", default=DEFAULT_ADJUSTMENT_VERSION)
     parser.add_argument(
@@ -87,11 +124,35 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="No guardar la ejecución en MySQL.",
     )
     parser.add_argument(
+        "--sweep",
+        action="store_true",
+        help="Barrido de --sl-multiples x --exposures en lugar de un único backtest.",
+    )
+    parser.add_argument(
+        "--sl-multiples",
+        nargs="+",
+        type=Decimal,
+        default=list(DEFAULT_STOP_LOSS_ATR_MULTIPLES),
+        help="Multiplicadores de stop loss del barrido (por defecto: 1.0 1.5 2.0).",
+    )
+    parser.add_argument(
+        "--exposures",
+        nargs="+",
+        type=Decimal,
+        default=list(DEFAULT_MAX_POSITION_EXPOSURES),
+        help="Exposiciones máximas del barrido (por defecto: 0.10 0.15 0.20).",
+    )
+    parser.add_argument(
         "--list-runs",
         type=int,
         metavar="N",
         default=None,
         help="Muestra las N ejecuciones más recientes guardadas y termina.",
+    )
+    parser.add_argument(
+        "--sweep-id",
+        default=None,
+        help="Con --list-runs, muestra sólo las ejecuciones de ese barrido.",
     )
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument(
@@ -111,34 +172,46 @@ def build_calendar(name: str) -> TradingCalendar | None:
     return ExchangeCalendar(name.upper())
 
 
-def run_backtest_command(
+def build_request(
     arguments: argparse.Namespace,
-    session_factory: Callable[[], Session],
-    default_initial_cash: Decimal,
-    max_positions: int,
-    calendar: TradingCalendar | None,
-) -> tuple[BacktestRunOutcome, Path, Path]:
-    symbols = tuple(symbol.upper() for symbol in arguments.symbols)
-    end = arguments.end or default_end_date()
-    costs = CostModel()
+    settings: ApplicationSettings,
+) -> BacktestRunRequest:
+    profile_name = arguments.cost_profile.lower()
+    profile = settings.cost_profile(profile_name)
+    costs = CostModel(
+        commission_rate=profile.commission_rate,
+        slippage_rate=profile.slippage_rate,
+    )
     parameters = BacktestParameters(
-        initial_cash=arguments.initial_cash or default_initial_cash,
+        initial_cash=arguments.initial_cash or settings.initial_capital,
+        cost_profile=profile_name,
         risk=RiskParameters(
-            max_positions=max_positions,
+            max_positions=settings.max_positions,
+            max_position_exposure=arguments.max_position_exposure,
+            stop_loss_atr_multiple=arguments.stop_loss_atr,
             commission_rate=costs.commission_rate,
         ),
         costs=costs,
         gap_threshold_atr=arguments.gap_threshold_atr,
     )
-    request = BacktestRunRequest(
-        symbols=symbols,
+    return BacktestRunRequest(
+        symbols=tuple(symbol.upper() for symbol in arguments.symbols),
         start=arguments.start,
-        end=end,
+        end=arguments.end or default_end_date(),
         parameters=parameters,
         source=arguments.source,
         adjustment_version=arguments.adjustment_version,
         include_dividends=not arguments.no_dividends,
     )
+
+
+def run_backtest_command(
+    arguments: argparse.Namespace,
+    session_factory: Callable[[], Session],
+    settings: ApplicationSettings,
+    calendar: TradingCalendar | None,
+) -> tuple[BacktestRunOutcome, Path, Path]:
+    request = build_request(arguments, settings)
 
     with session_factory() as session:
         outcome = BacktestRunService(session, calendar=calendar).run(
@@ -146,9 +219,43 @@ def run_backtest_command(
             persist=not arguments.no_persist,
         )
 
-    name = arguments.name or default_report_name(symbols, arguments.start, end)
+    name = arguments.name or default_report_name(
+        request.symbols, request.start, request.end
+    )
     json_path, markdown_path = write_report(outcome.report, arguments.output_dir, name)
     return outcome, json_path, markdown_path
+
+
+def run_sweep_command(
+    arguments: argparse.Namespace,
+    session_factory: Callable[[], Session],
+    settings: ApplicationSettings,
+    calendar: TradingCalendar | None,
+) -> tuple[SensitivityReport, Path, Path]:
+    request = build_request(arguments, settings)
+    grid = ParameterGrid(
+        stop_loss_atr_multiples=tuple(arguments.sl_multiples),
+        max_position_exposures=tuple(arguments.exposures),
+    )
+
+    with session_factory() as session:
+        report = SensitivityAnalysisService(
+            BacktestRunService(session, calendar=calendar)
+        ).run(request, grid, persist=not arguments.no_persist)
+
+    name = arguments.name or (
+        "sensitivity_"
+        + default_report_name(request.symbols, request.start, request.end).removeprefix(
+            "backtest_"
+        )
+        + f"_{request.parameters.cost_profile}"
+    )
+    json_path, markdown_path = write_sensitivity_report(
+        report,
+        arguments.output_dir,
+        name,
+    )
+    return report, json_path, markdown_path
 
 
 def format_summary(
@@ -160,12 +267,16 @@ def format_summary(
     metrics = report.metrics
     trades = metrics.trades
     buy_and_hold = metrics.buy_and_hold
+    risk = report.parameters.risk
 
     lines = [
         f"Ejecución: {outcome.run_id or 'no guardada'}",
         f"Símbolos: {', '.join(report.symbols)}",
         f"Periodo: {report.start} → {report.end}  "
         f"Calendario: {report.trading_calendar or 'ninguno'}",
+        f"Costes: {report.parameters.cost_profile or 'n/d'}  "
+        f"SL: {risk.stop_loss_atr_multiple} × ATR  "
+        f"Exposición máx.: {_pct(risk.max_position_exposure)}",
         f"Equity final: {metrics.final_equity:,.2f}  "
         f"Retorno: {_pct(metrics.cumulative_return)}  "
         f"MDD: {_pct(metrics.max_drawdown.max_drawdown_pct)}  "
@@ -186,23 +297,50 @@ def format_summary(
     return "\n".join(lines)
 
 
+def format_sweep_summary(
+    report: SensitivityReport,
+    json_path: Path,
+    markdown_path: Path,
+) -> str:
+    parameters = report.base_parameters
+    lines = [
+        f"Barrido: {report.sweep_id or 'no guardado'}",
+        f"Símbolos: {', '.join(report.symbols)}  Periodo: {report.start} → "
+        f"{report.end}",
+        f"Costes: {parameters.cost_profile}  "
+        f"Buy & Hold: {_pct(report.buy_and_hold_return)}",
+        "",
+        *sensitivity_table(report.rows),
+        "",
+        f"Informe JSON: {json_path}",
+        f"Informe Markdown: {markdown_path}",
+    ]
+    return "\n".join(lines)
+
+
 def format_runs(runs: Sequence[BacktestRunSummary]) -> str:
     if not runs:
         return "No hay ejecuciones guardadas."
 
     lines = [
-        f"{'run_id':<36} {'creado (UTC)':<19} {'periodo':<23} {'gap':>4} "
-        f"{'retorno':>9} {'MDD':>8} {'trades':>6} {'PF':>5} {'B&H':>9}"
+        f"{'run_id':<36} {'creado (UTC)':<19} {'periodo':<23} {'costes':<11} "
+        f"{'SL':>4} {'exp.':>5} {'gap':>4} {'retorno':>9} {'MDD':>8} "
+        f"{'trades':>6} {'PF':>5} {'B&H':>9} sweep"
     ]
 
     for run in runs:
-        gap = run.parameters.get("gap_threshold_atr", "-")
+        parameters = run.parameters
+        risk = parameters.get("risk", {})
         lines.append(
             f"{run.run_id:<36} {run.created_at:%Y-%m-%d %H:%M:%S} "
-            f"{run.start_date} → {run.end_date} {gap!s:>4} "
+            f"{run.start_date} → {run.end_date} "
+            f"{parameters.get('cost_profile') or '-':<11} "
+            f"{risk.get('stop_loss_atr_multiple', '-')!s:>4} "
+            f"{risk.get('max_position_exposure', '-')!s:>5} "
+            f"{parameters.get('gap_threshold_atr', '-')!s:>4} "
             f"{_pct(run.cumulative_return):>9} {_pct(run.max_drawdown_pct):>8} "
             f"{run.total_trades:>6} {_ratio(run.profit_factor):>5} "
-            f"{_pct(run.buy_and_hold_return):>9}"
+            f"{_pct(run.buy_and_hold_return):>9} {(run.sweep_id or '-')[:8]}"
         )
 
     return "\n".join(lines)
@@ -211,22 +349,35 @@ def format_runs(runs: Sequence[BacktestRunSummary]) -> str:
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = parse_args(argv)
 
-    from algo_trading.config.settings import ApplicationSettings
     from algo_trading.persistence.database import SessionFactory
 
     if arguments.list_runs is not None:
         with SessionFactory() as session:
-            runs = BacktestRunRepository(session).list_summaries(arguments.list_runs)
+            runs = BacktestRunRepository(session).list_summaries(
+                arguments.list_runs,
+                sweep_id=arguments.sweep_id,
+            )
         print(format_runs(runs))
         return 0
 
     settings = ApplicationSettings.from_yaml()
+    calendar = build_calendar(arguments.calendar)
+
+    if arguments.sweep:
+        report, json_path, markdown_path = run_sweep_command(
+            arguments,
+            session_factory=SessionFactory,
+            settings=settings,
+            calendar=calendar,
+        )
+        print(format_sweep_summary(report, json_path, markdown_path))
+        return 0
+
     outcome, json_path, markdown_path = run_backtest_command(
         arguments,
         session_factory=SessionFactory,
-        default_initial_cash=settings.initial_capital,
-        max_positions=settings.max_positions,
-        calendar=build_calendar(arguments.calendar),
+        settings=settings,
+        calendar=calendar,
     )
     print(format_summary(outcome, json_path, markdown_path))
     return 0

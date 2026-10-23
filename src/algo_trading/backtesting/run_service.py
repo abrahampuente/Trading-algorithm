@@ -69,6 +69,16 @@ class BacktestRunOutcome(BaseModel):
     report_checksum: str
 
 
+class PreparedMarketData(BaseModel):
+    """Datos leídos una vez de MySQL y reutilizables entre ejecuciones."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    bars_by_symbol: dict[str, tuple[MarketBar, ...]]
+    dividends_by_symbol: dict[str, tuple[CorporateDividend, ...]]
+    trading_sessions: tuple[date, ...] | None
+
+
 class BacktestRunService:
     """
     Ejecuta un backtest sobre los datos de MySQL y persiste su resultado.
@@ -165,33 +175,59 @@ class BacktestRunService:
 
         return dividends_by_symbol
 
+    def prepare(self, request: BacktestRunRequest) -> PreparedMarketData:
+        """Lee barras, dividendos y sesiones del periodo solicitado."""
+        return PreparedMarketData(
+            bars_by_symbol=self.load_bars(request),
+            dividends_by_symbol=(
+                self.load_adjusted_dividends(request)
+                if request.include_dividends
+                else {}
+            ),
+            trading_sessions=(
+                tuple(
+                    session.session_date
+                    for session in self._calendar.sessions(request.start, request.end)
+                )
+                if self._calendar is not None
+                else None
+            ),
+        )
+
     def run(
         self,
         request: BacktestRunRequest,
         persist: bool = True,
+        sweep_id: str | None = None,
     ) -> BacktestRunOutcome:
-        bars_by_symbol = self.load_bars(request)
-        dividends_by_symbol = (
-            self.load_adjusted_dividends(request) if request.include_dividends else {}
-        )
-        trading_sessions = (
-            tuple(
-                session.session_date
-                for session in self._calendar.sessions(request.start, request.end)
-            )
-            if self._calendar is not None
-            else None
+        return self.run_prepared(
+            request,
+            self.prepare(request),
+            persist=persist,
+            sweep_id=sweep_id,
         )
 
+    def run_prepared(
+        self,
+        request: BacktestRunRequest,
+        data: PreparedMarketData,
+        persist: bool = True,
+        sweep_id: str | None = None,
+    ) -> BacktestRunOutcome:
+        """
+        Ejecuta el backtest con datos ya preparados.
+
+        Permite variar `request.parameters` sin volver a leer MySQL (barridos).
+        """
         result = BacktestEngine(request.parameters).run(
-            bars_by_symbol,
-            trading_sessions=trading_sessions,
-            dividends_by_symbol=dividends_by_symbol,
+            data.bars_by_symbol,
+            trading_sessions=data.trading_sessions,
+            dividends_by_symbol=data.dividends_by_symbol,
         )
         report = build_report(
             result,
-            bars_by_symbol,
-            dividends_by_symbol=dividends_by_symbol,
+            data.bars_by_symbol,
+            dividends_by_symbol=data.dividends_by_symbol,
             trading_calendar=self._calendar.name if self._calendar else None,
         )
         checksum = hashlib.sha256(report_to_json(report).encode("utf-8")).hexdigest()
@@ -216,6 +252,7 @@ class BacktestRunService:
                     adjustment_version=request.adjustment_version,
                     start_date=request.start,
                     end_date=request.end,
+                    sweep_id=sweep_id,
                 ),
             )
             self._session.commit()

@@ -30,6 +30,7 @@ class BacktestRunModel(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     report_version: Mapped[str] = mapped_column(String(32), nullable=False)
     report_checksum: Mapped[str] = mapped_column(String(64), nullable=False)
+    sweep_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
 
     symbols: Mapped[str] = mapped_column(String(512), nullable=False)
     start_date: Mapped[date] = mapped_column(Date, nullable=False)
@@ -63,7 +64,10 @@ class BacktestRunModel(Base):
     )
     excess_return: Mapped[Decimal | None] = mapped_column(RATIO, nullable=True)
 
-    __table_args__ = (Index("ix_backtest_runs_created_at", "created_at"),)
+    __table_args__ = (
+        Index("ix_backtest_runs_created_at", "created_at"),
+        Index("ix_backtest_runs_sweep_id", "sweep_id"),
+    )
 
 
 class BacktestTradeModel(Base):

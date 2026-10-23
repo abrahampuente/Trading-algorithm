@@ -109,6 +109,9 @@ def report_to_markdown(report: BacktestReport) -> str:
         f"| Exposición máxima por posición | "
         f"{_pct(parameters.risk.max_position_exposure)} |",
         f"| Máximo de posiciones | {parameters.risk.max_positions} |",
+        f"| Stop Loss | {parameters.risk.stop_loss_atr_multiple} × ATR |",
+        f"| Take Profit | {parameters.risk.take_profit_atr_multiple} × ATR |",
+        f"| Perfil de costes | {parameters.cost_profile or NOT_AVAILABLE} |",
         f"| Comisión | {_pct(parameters.costs.commission_rate)} |",
         f"| Slippage | {_pct(parameters.costs.slippage_rate)} |",
         f"| Umbral anti-gap | {parameters.gap_threshold_atr} × ATR |",

@@ -19,9 +19,12 @@ from algo_trading.backtesting.run_service import (
 from algo_trading.cli.backtest import (
     format_runs,
     format_summary,
+    format_sweep_summary,
     parse_args,
     run_backtest_command,
+    run_sweep_command,
 )
+from algo_trading.config.settings import ApplicationSettings
 from algo_trading.data.market_calendar import SessionCoverageError, TradingSession
 from algo_trading.execution import ExitReason
 from algo_trading.persistence.models import (
@@ -37,6 +40,7 @@ from algo_trading.persistence.repositories.backtest_run_repository import (
 )
 
 START = datetime(2024, 1, 1)
+SETTINGS = ApplicationSettings.from_yaml()
 CREATED_AT = datetime(2026, 10, 22, 21, 0, tzinfo=UTC)
 
 
@@ -341,14 +345,15 @@ def test_cli_writes_reports_and_persists_run(engine: Engine, tmp_path: Path) -> 
             "2024-01-23",
             "--output-dir",
             str(tmp_path),
+            "--initial-cash",
+            "50000",
         ]
     )
 
     outcome, json_path, markdown_path = run_backtest_command(
         arguments,
         session_factory=sessionmaker(bind=engine),
-        default_initial_cash=Decimal("50000"),
-        max_positions=5,
+        settings=SETTINGS,
         calendar=None,
     )
 
@@ -383,8 +388,7 @@ def test_cli_no_persist_and_no_dividends(engine: Engine, tmp_path: Path) -> None
     outcome, _, _ = run_backtest_command(
         arguments,
         session_factory=sessionmaker(bind=engine),
-        default_initial_cash=Decimal("50000"),
-        max_positions=5,
+        settings=SETTINGS,
         calendar=None,
     )
 
@@ -408,7 +412,201 @@ def test_cli_defaults() -> None:
     assert not arguments.no_persist
     assert not arguments.no_dividends
     assert arguments.list_runs is None
+    assert arguments.cost_profile == "base"
+    assert arguments.stop_loss_atr == Decimal("1")
+    assert arguments.max_position_exposure == Decimal("0.10")
+    assert not arguments.sweep
+    assert arguments.sl_multiples == [Decimal("1.0"), Decimal("1.5"), Decimal("2.0")]
+    assert arguments.exposures == [Decimal("0.10"), Decimal("0.15"), Decimal("0.20")]
 
 
 def test_format_runs_without_runs() -> None:
     assert format_runs(()) == "No hay ejecuciones guardadas."
+
+
+def cli_arguments(tmp_path: Path, *extra: str) -> list[str]:
+    return [
+        "--symbols",
+        "AAA",
+        "--start",
+        "2024-01-01",
+        "--end",
+        "2024-01-23",
+        "--output-dir",
+        str(tmp_path),
+        *extra,
+    ]
+
+
+@pytest.mark.parametrize(
+    ("profile", "rate"),
+    [
+        ("optimista", Decimal("0.0002")),
+        ("base", Decimal("0.0005")),
+        ("Conservador", Decimal("0.0010")),
+    ],
+)
+def test_cli_applies_cost_profile(
+    engine: Engine,
+    tmp_path: Path,
+    profile: str,
+    rate: Decimal,
+) -> None:
+    arguments = parse_args(
+        cli_arguments(tmp_path, "--cost-profile", profile, "--no-persist")
+    )
+
+    outcome, _, markdown_path = run_backtest_command(
+        arguments,
+        session_factory=sessionmaker(bind=engine),
+        settings=SETTINGS,
+        calendar=None,
+    )
+
+    parameters = outcome.report.parameters
+    assert parameters.cost_profile == profile.lower()
+    assert parameters.costs.commission_rate == rate
+    assert parameters.costs.slippage_rate == rate
+    assert parameters.risk.commission_rate == rate
+    assert f"| Perfil de costes | {profile.lower()} |" in markdown_path.read_text(
+        encoding="utf-8"
+    )
+
+
+def test_more_expensive_profile_lowers_net_result(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    results = {}
+
+    for profile in ("optimista", "conservador"):
+        outcome, _, _ = run_backtest_command(
+            parse_args(
+                cli_arguments(tmp_path, "--cost-profile", profile, "--no-persist")
+            ),
+            session_factory=sessionmaker(bind=engine),
+            settings=SETTINGS,
+            calendar=None,
+        )
+        results[profile] = outcome.report.metrics
+
+    assert results["conservador"].trades.total_costs > (
+        results["optimista"].trades.total_costs
+    )
+    assert results["conservador"].final_equity < results["optimista"].final_equity
+
+
+def test_cli_rejects_unknown_cost_profile(engine: Engine, tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="Perfil de costes desconocido"):
+        run_backtest_command(
+            parse_args(cli_arguments(tmp_path, "--cost-profile", "agresivo")),
+            session_factory=sessionmaker(bind=engine),
+            settings=SETTINGS,
+            calendar=None,
+        )
+
+
+def test_cli_applies_stop_loss_multiple_and_exposure(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    arguments = parse_args(
+        cli_arguments(
+            tmp_path,
+            "--stop-loss-atr",
+            "1.5",
+            "--max-position-exposure",
+            "0.2",
+            "--no-persist",
+        )
+    )
+
+    outcome, _, _ = run_backtest_command(
+        arguments,
+        session_factory=sessionmaker(bind=engine),
+        settings=SETTINGS,
+        calendar=None,
+    )
+
+    trade = outcome.report.trades[0]
+    assert outcome.report.parameters.risk.stop_loss_atr_multiple == Decimal("1.5")
+    assert outcome.report.parameters.risk.max_position_exposure == Decimal("0.2")
+    assert trade.stop_loss == trade.entry_executed_price - Decimal("1.5") * (
+        trade.entry_atr
+    )
+
+
+def test_cli_sweep_runs_grid_and_persists_runs_with_shared_sweep_id(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    arguments = parse_args(
+        cli_arguments(
+            tmp_path,
+            "--sweep",
+            "--sl-multiples",
+            "1",
+            "2",
+            "--exposures",
+            "0.10",
+            "0.20",
+        )
+    )
+
+    report, json_path, markdown_path = run_sweep_command(
+        arguments,
+        session_factory=sessionmaker(bind=engine),
+        settings=SETTINGS,
+        calendar=None,
+    )
+
+    assert [
+        (row.stop_loss_atr_multiple, row.max_position_exposure) for row in report.rows
+    ] == [
+        (Decimal("1"), Decimal("0.10")),
+        (Decimal("1"), Decimal("0.20")),
+        (Decimal("2"), Decimal("0.10")),
+        (Decimal("2"), Decimal("0.20")),
+    ]
+    assert report.sweep_id is not None
+    assert all(row.run_id is not None for row in report.rows)
+    assert json_path.name == "sensitivity_AAA_2024-01-01_2024-01-23_base.json"
+    markdown = markdown_path.read_text(encoding="utf-8")
+    assert markdown.startswith("# Análisis de sensibilidad")
+    assert "| SL × ATR | Exposición | Retorno | MDD | Win Rate | Profit Factor" in (
+        markdown
+    )
+    assert "Barrido: " in format_sweep_summary(report, json_path, markdown_path)
+
+    with Session(engine) as session:
+        runs = BacktestRunRepository(session).list_summaries(sweep_id=report.sweep_id)
+
+    assert len(runs) == 4
+    assert {run.run_id for run in runs} == {row.run_id for row in report.rows}
+    assert {
+        (
+            run.parameters["risk"]["stop_loss_atr_multiple"],
+            run.parameters["risk"]["max_position_exposure"],
+        )
+        for run in runs
+    } == {("1", "0.10"), ("1", "0.20"), ("2", "0.10"), ("2", "0.20")}
+    assert "1" in format_runs(runs)
+
+
+def test_sweep_varies_results_with_parameters(engine: Engine, tmp_path: Path) -> None:
+    report, _, _ = run_sweep_command(
+        parse_args(cli_arguments(tmp_path, "--sweep", "--no-persist")),
+        session_factory=sessionmaker(bind=engine),
+        settings=SETTINGS,
+        calendar=None,
+    )
+
+    assert len(report.rows) == 9
+    assert report.sweep_id is None
+    # Exposición mayor → posición mayor → mayor resultado absoluto (trade ganador).
+    by_exposure = {
+        row.max_position_exposure: row.final_equity
+        for row in report.rows
+        if row.stop_loss_atr_multiple == Decimal("1.0")
+    }
+    assert by_exposure[Decimal("0.20")] > by_exposure[Decimal("0.10")]

@@ -10,6 +10,34 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 LOCAL_CONFIG_PATH = PROJECT_ROOT / "configs" / "environments" / "local.yaml"
 
 
+class CostProfileSettings(BaseModel):
+    """Costes por ejecución expresados como fracción (0.0005 = 0,05 %)."""
+
+    commission_rate: Decimal = Field(ge=0, lt=1)
+    slippage_rate: Decimal = Field(ge=0, lt=1)
+
+
+DEFAULT_COST_PROFILE = "base"
+
+
+def default_cost_profiles() -> dict[str, CostProfileSettings]:
+    """Perfiles de la v1: optimista, base y conservador."""
+    return {
+        "optimista": CostProfileSettings(
+            commission_rate=Decimal("0.0002"),
+            slippage_rate=Decimal("0.0002"),
+        ),
+        "base": CostProfileSettings(
+            commission_rate=Decimal("0.0005"),
+            slippage_rate=Decimal("0.0005"),
+        ),
+        "conservador": CostProfileSettings(
+            commission_rate=Decimal("0.0010"),
+            slippage_rate=Decimal("0.0010"),
+        ),
+    }
+
+
 class DatabaseSettings(BaseModel):
     host: str
     port: int = Field(gt=0, le=65535)
@@ -35,6 +63,11 @@ class ApplicationSettings(BaseSettings):
 
     database: DatabaseSettings
 
+    cost_profiles: dict[str, CostProfileSettings] = Field(
+        default_factory=default_cost_profiles,
+        min_length=1,
+    )
+
     database_password: str | None = None
 
     @classmethod
@@ -57,3 +90,15 @@ class ApplicationSettings(BaseSettings):
             settings.database.password = settings.database_password
 
         return settings
+
+    def cost_profile(self, name: str) -> CostProfileSettings:
+        """Devuelve un perfil de costes por nombre (sin distinguir mayúsculas)."""
+        profiles = {key.lower(): value for key, value in self.cost_profiles.items()}
+
+        try:
+            return profiles[name.lower()]
+        except KeyError:
+            available = ", ".join(sorted(self.cost_profiles))
+            raise ValueError(
+                f"Perfil de costes desconocido: {name}. Disponibles: {available}"
+            ) from None

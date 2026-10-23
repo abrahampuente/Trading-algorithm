@@ -10,3 +10,15 @@ database:
   port: 3306
   name: algo_trading
   user: algo_trading_app
+
+# Perfiles de costes por ejecución (fracción: 0.0005 = 0,05 %).
+cost_profiles:
+  optimista:
+    commission_rate: 0.0002
+    slippage_rate: 0.0002
+  base:
+    commission_rate: 0.0005
+    slippage_rate: 0.0005
+  conservador:
+    commission_rate: 0.0010
+    slippage_rate: 0.0010
