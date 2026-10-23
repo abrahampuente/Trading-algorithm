@@ -3,7 +3,7 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, Field, SecretStr, model_validator
+from pydantic import AliasChoices, BaseModel, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -183,7 +183,12 @@ class ApplicationSettings(BaseSettings):
 
     database_password: str | None = None
     alpaca_api_key_id: str | None = None
-    alpaca_api_secret_key: SecretStr | None = None
+    # Acepta también ALPACA_SECRET_KEY, el nombre habitual en la documentación
+    # de Alpaca.
+    alpaca_api_secret_key: SecretStr | None = Field(
+        default=None,
+        validation_alias=AliasChoices("alpaca_api_secret_key", "alpaca_secret_key"),
+    )
 
     @classmethod
     def from_yaml(

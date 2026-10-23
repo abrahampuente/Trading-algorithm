@@ -7,9 +7,9 @@ La especificación técnica de la v2 está en `docs/technical-spec-v2.md`. Cubre
 Roadmap v2:
 
 ```text
-Hito 1  Especificación v2 y motor de señales multi-factor          en curso (especificación redactada)
-Hito 2  Proveedor intradía y simulación exacta intrabarra           pendiente
-Hito 3  Adaptador de broker en Sandbox (paper) y motor de órdenes   pendiente
+Hito 1  Especificación v2 y motor de señales multi-factor          parcial (filtros de régimen; Short pendiente)
+Hito 2  Proveedor intradía y simulación exacta intrabarra           validado con Alpaca real
+Hito 3  Adaptador de broker en Sandbox (paper) y motor de órdenes   en curso
 Hito 4  Scheduler diario/intradía, latencia y notificaciones        pendiente
 Hito 5  Paper trading en vivo de 30-60 sesiones                     pendiente
 ```
@@ -98,7 +98,7 @@ Lectura:
 
 Pendiente en el Hito 1: filtro sectorial con topes de exposición mayores; confirmación por volumen; Short y reversión a la media (requieren generalizar `EntryCandidate` más allá de `LongSignal`).
 
-### Hito 2 (en curso): datos intradía y resolución intrabarra SL / TP
+### Hito 2: datos intradía y resolución intrabarra SL / TP
 
 Proveedor `AlpacaMarketDataProvider` (`data/providers/alpaca.py`), Alpaca Market Data API v2 (`GET /v2/stocks/bars`):
 
@@ -127,9 +127,63 @@ Integración:
 - `algo-backtest --intrabar-resolution`: proveedor Alpaca con `adjustment = split` y el calendario; falla si faltan las credenciales o el calendario. Sólo en backtests individuales; informe con la etiqueta `intrabar`.
 - Regresión: sin `--intrabar-resolution` el checksum v1 no cambia (`test_v1_regression.py` en verde).
 
-Aún no hay credenciales de Alpaca en `.env`: el adaptador está verificado sólo con respuestas simuladas, no contra la API real.
+Validación con la API real (2026-10-23):
 
-Pendiente en el Hito 2: probar con credenciales reales y medir el número de conflictos SL / TP del backtest diversificado y su impacto; persistir las barras de 1 minuto descargadas como snapshots (`market_bars_raw`, timeframe `1m`) para no repetir descargas; resolución intrabarra en walk-forward; correlación de cartera y costes dinámicos.
+- Credenciales en `.env`: `ALPACA_API_KEY_ID`, `ALPACA_SECRET_KEY` (nombre habitual de Alpaca, aceptado como alias de `ALPACA_API_SECRET_KEY`) y `ALPACA_PAPER`. El primer par de claves devolvía 401 en `data.alpaca.markets` y `paper-api.alpaca.markets`; con las claves regeneradas la autenticación funciona.
+- Ejecución: `algo-backtest --intrabar-resolution --stop-loss-atr 0.75 --take-profit-atr 1 --no-persist` (diversified, 2020-01-02 → 2026-10-22, feed IEX, `adjustment = split`). Informe `reports/intrabar_comparison_diversified_2020-01-01_2026-10-22.md`.
+
+```text
+Conflictos SL / TP                        5
+  INTRADAY_PATH (minutos descargados)     3  → TP primero en los 3
+  OPENING_GAP (sin descarga)              2  → SL a la apertura
+  Fallback v1                             0
+
+Sesión resuelta  Primer toque (UTC)  Minutos IEX  Salida
+QQQ 2021-01-25   14:37               296          TP 330.10
+AAPL 2023-06-05  14:08               390          TP 183.86
+CAT 2026-02-04   14:32               343          TP 713.58
+
+                    v1 (SL primero)   Intrabarra   Diferencia
+Retorno acumulado   -16.33 %          -14.67 %     +1.66 pp
+Maximum Drawdown     16.33 %           14.67 %     -1.66 pp
+Win Rate             43.01 %           43.66 %     +0.65 pp
+Profit Factor         0.78              0.80       +0.02
+Expectancy R         -0.15             -0.13       +0.02
+Salidas SL / TP      265 / 200         262 / 203
+Trades distintos de la v1: 278 de 465 (efecto del cash en operaciones posteriores)
+
+API Alpaca: 3 peticiones, 3 correctas, 0 errores 429 / 5xx / red / 4xx; latencia media 768 ms (máx. 980 ms);
+cuota 200 peticiones/min, mínimo restante 199; sin esperas; 5,9 s en total (dos backtests y descargas).
+```
+
+Lectura:
+
+- El adaptador funciona con datos reales: autenticación, paginación, sesión regular (incluidos minutos sin operaciones en IEX: 296-390 de 390) y escala ajustada coherente con las barras diarias (ninguna sesión cayó en `FALLBACK_INCONSISTENT`).
+- Las tres sesiones resueltas con minutos alcanzaron el TP en los primeros minutos de la sesión, cuando la v1 las habría cerrado por SL. La mejora es real pero pequeña (+1,66 pp) y se da en una configuración no operable (pérdidas del 15-16 %), elegida sólo para provocar conflictos.
+- Con los valores v1 bloqueados (SL 2 × ATR, TP 3 × ATR) no hay ningún conflicto: la resolución intrabarra no cambia la v1 y la regla conservadora no sesgó sus resultados.
+- Los nombres de informe no incluyen SL / TP: una ejecución con niveles no estándar sobrescribe el informe con los valores por defecto (pendiente menor).
+
+Detalles de la implementación tras la validación:
+
+- Ante 401 / 403 el proveedor lanza `AlpacaAuthenticationError` y el resolver de la CLI la propaga (`fatal_errors`) en lugar de completar el backtest con fallback v1 en cada sesión.
+- Telemetría por proveedor (`AlpacaRequestStats`): peticiones e intentos, 429 / 5xx / red / 4xx, latencia media y máxima, espera por cuota y backoff, `X-RateLimit-Limit` y mínimo de `X-RateLimit-Remaining`.
+- `algo-backtest --intrabar-resolution` ejecuta ahora también el backtest con la regla v1 sobre los mismos datos (en memoria, sin persistir) y escribe `reports/intrabar_comparison_<etiqueta>.md|.json`: conflictos, TP primero / SL primero / fallback, impacto en retorno, MDD, Win Rate, Profit Factor, Expectancy y trades, trades que cambian y métricas de la API.
+
+Conflictos SL / TP reales (diversified, 2020-01-01 → 2026-10-22, contados sin API con el resolver sin fuente):
+
+```text
+SL × ATR  TP × ATR  Trades  Conflictos  Necesitan datos intradía
+2.0       3.0       332     0           0    (valores v1 bloqueados)
+1.5       2.5       368     0           0
+1.0       2.0       413     0           0    (especificación v1 original)
+1.0       1.5       438     2           1    (1 OPENING_GAP)
+0.75      1.0       465     5           3    (2 OPENING_GAP)
+```
+
+- Con los valores v1 la distancia SL–TP es de 5 × ATR y ninguna vela diaria la cubre: `--intrabar-resolution` no descarga nada y reproduce exactamente la v1 (26,29 %, MDD 8,13 %, Win Rate 47,59 %, PF 1,21; 0 peticiones a Alpaca). La regla conservadora de la v1 no ha sesgado los resultados publicados.
+- La precedencia sólo importa con niveles por debajo de ≈2,5 × ATR de distancia total, fuera de la rejilla del walk-forward.
+
+Hito 2 cerrado en cuanto a datos intradía y resolución intrabarra. Pendiente (pasa a trabajos posteriores): persistir las barras de 1 minuto descargadas como snapshots (`market_bars_raw`, timeframe `1m`); correlación de cartera y costes dinámicos (más relevantes para la v1 que la resolución intrabarra, a la vista de los conflictos).
 
 ## v1 cerrada (2026-10-23)
 

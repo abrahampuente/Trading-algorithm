@@ -10,6 +10,7 @@ import pytest
 from algo_trading.data.market_calendar import TradingSession
 from algo_trading.data.providers.alpaca import (
     AlpacaAdjustment,
+    AlpacaAuthenticationError,
     AlpacaCredentials,
     AlpacaFeed,
     AlpacaMarketDataProvider,
@@ -321,3 +322,44 @@ def test_session_source_requests_regular_session_one_minute_bars() -> None:
         "2024-03-04T14:32:00Z",
     )
     assert source.get_session_bars("AAPL", date(2024, 3, 9)) == ()
+
+
+def test_authentication_errors_have_their_own_type() -> None:
+    with pytest.raises(AlpacaAuthenticationError, match="401"):
+        provider(FakeHttp(status(401)), []).get_bars(REQUEST)
+
+
+def test_request_stats_track_latency_quota_and_retries() -> None:
+    ticks = iter([0.0, 0.120, 1.0, 1.050, 2.0, 2.300])
+    sleeps: list[float] = []
+    http = FakeHttp(
+        status(500),
+        status(429, {"retry-after": "2"}),
+        ok(
+            {"bars": {"AAPL": [bar_json(0)]}},
+            {"x-ratelimit-limit": "200", "x-ratelimit-remaining": "187"},
+        ),
+    )
+    alpaca = provider(http, sleeps, timer=lambda: next(ticks))
+
+    alpaca.get_bars(REQUEST)
+    stats = alpaca.stats
+
+    assert stats.requests == 3
+    assert stats.successful == 1
+    assert (stats.server_errors, stats.rate_limited, stats.client_errors) == (1, 1, 0)
+    assert stats.max_latency_ms == pytest.approx(300)
+    assert stats.average_latency_ms == pytest.approx((120 + 50 + 300) / 3)
+    assert stats.slept_seconds == pytest.approx(3.0)
+    assert (stats.rate_limit_limit, stats.min_rate_limit_remaining) == (200, 187)
+
+
+def test_network_errors_count_as_requests_without_latency() -> None:
+    http = FakeHttp(OSError("sin red"), ok({"bars": {}}))
+    alpaca = provider(http, [])
+
+    alpaca.get_bars(REQUEST)
+
+    assert alpaca.stats.requests == 2
+    assert alpaca.stats.network_errors == 1
+    assert alpaca.stats.responses == 1

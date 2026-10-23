@@ -44,6 +44,7 @@ tiene prioridad como en la v1.
 """
 
 import argparse
+import time
 from collections.abc import Callable, Sequence
 from datetime import date
 from decimal import Decimal
@@ -51,6 +52,11 @@ from pathlib import Path
 
 from sqlalchemy.orm import Session
 
+from algo_trading.analytics.intrabar_comparison import (
+    IntrabarComparisonReport,
+    build_intrabar_comparison,
+    write_intrabar_comparison,
+)
 from algo_trading.analytics.report import write_report
 from algo_trading.analytics.walk_forward import (
     SelectionMetric,
@@ -89,6 +95,7 @@ from algo_trading.config.settings import (
 from algo_trading.data.market_calendar import DEFAULT_EXCHANGE, TradingCalendar
 from algo_trading.data.providers.alpaca import (
     AlpacaAdjustment,
+    AlpacaAuthenticationError,
     AlpacaCredentials,
     AlpacaFeed,
     AlpacaMarketDataProvider,
@@ -389,6 +396,7 @@ def build_intrabar_resolver(
     return IntrabarResolver(
         AlpacaSessionBarSource(provider, calendar),
         price_tolerance=intraday.price_tolerance,
+        fatal_errors=(AlpacaAuthenticationError,),
     )
 
 
@@ -599,6 +607,93 @@ def run_backtest_command(
     name = arguments.name or report_label("backtest", arguments, request, settings)
     json_path, markdown_path = write_report(outcome.report, arguments.output_dir, name)
     return outcome, json_path, markdown_path
+
+
+def run_intrabar_comparison_command(
+    arguments: argparse.Namespace,
+    session_factory: Callable[[], Session],
+    settings: ApplicationSettings,
+    calendar: TradingCalendar | None,
+) -> tuple[BacktestRunOutcome, Path, Path, IntrabarComparisonReport, Path]:
+    """
+    Backtest con resolución intrabarra y el mismo backtest con la regla v1.
+
+    Lee los datos diarios una vez; la ejecución v1 no se persiste (es la de
+    referencia). Escribe el informe del backtest intrabarra y la comparación
+    `intrabar_comparison_<etiqueta>.md|.json`.
+    """
+    request = build_request(arguments, settings)
+    resolver = build_intrabar_resolver(arguments, settings, calendar)
+
+    if resolver is None:
+        raise ValueError("La comparación intrabarra necesita --intrabar-resolution")
+
+    started = time.perf_counter()
+
+    with session_factory() as session:
+        service = BacktestRunService(session, calendar=calendar)
+        data = service.prepare(request)
+        generator = build_signal_generator(arguments, settings)
+        baseline = service.run_prepared(
+            request, data, persist=False, signal_generator=generator
+        )
+        outcome = service.run_prepared(
+            request,
+            data,
+            persist=not arguments.no_persist,
+            signal_generator=generator,
+            intrabar_resolver=resolver,
+        )
+
+    source = resolver.source
+    comparison = build_intrabar_comparison(
+        v1_report=baseline.report,
+        v1_checksum=baseline.report_checksum,
+        intrabar_report=outcome.report,
+        intrabar_checksum=outcome.report_checksum,
+        intrabar_run_id=outcome.run_id,
+        sessions_requested=resolver.requested_sessions,
+        api=(
+            source.provider.stats
+            if isinstance(source, AlpacaSessionBarSource)
+            else None
+        ),
+        elapsed_seconds=time.perf_counter() - started,
+    )
+    name = arguments.name or report_label("backtest", arguments, request, settings)
+    json_path, markdown_path = write_report(outcome.report, arguments.output_dir, name)
+    _, comparison_path = write_intrabar_comparison(
+        comparison,
+        arguments.output_dir,
+        name.replace("backtest_intrabar", "intrabar_comparison", 1),
+    )
+    return outcome, json_path, markdown_path, comparison, comparison_path
+
+
+def format_intrabar_comparison(
+    comparison: IntrabarComparisonReport, markdown_path: Path
+) -> str:
+    v1 = comparison.v1
+    intrabar = comparison.intrabar
+    api = comparison.api
+    lines = [
+        f"Comparación v1 (SL primero) → intrabarra: retorno "
+        f"{_pct(v1.cumulative_return)} → {_pct(intrabar.cumulative_return)}  "
+        f"MDD {_pct(v1.max_drawdown_pct)} → {_pct(intrabar.max_drawdown_pct)}  "
+        f"Win Rate {_pct(v1.win_rate)} → {_pct(intrabar.win_rate)}  "
+        f"PF {_ratio(v1.profit_factor)} → {_ratio(intrabar.profit_factor)}",
+    ]
+
+    if api is not None:
+        lines.append(
+            f"API Alpaca: {api.requests} peticiones, {api.successful} correctas, "
+            f"latencia media {api.average_latency_ms or 0:.0f} ms (máx. "
+            f"{api.max_latency_ms:.0f} ms), 429: {api.rate_limited}, "
+            f"cuota mínima restante {api.min_rate_limit_remaining}"
+        )
+
+    lines.append(f"Informe comparativo: {markdown_path}")
+    return "\n".join(lines)
 
 
 def run_sweep_command(
@@ -914,6 +1009,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             calendar=calendar,
         )
         print(format_sweep_summary(report, json_path, markdown_path))
+        return 0
+
+    if arguments.intrabar_resolution:
+        outcome, json_path, markdown_path, comparison, comparison_path = (
+            run_intrabar_comparison_command(
+                arguments,
+                session_factory=SessionFactory,
+                settings=settings,
+                calendar=calendar,
+            )
+        )
+        print(format_summary(outcome, json_path, markdown_path))
+        print(format_intrabar_comparison(comparison, comparison_path))
         return 0
 
     outcome, json_path, markdown_path = run_backtest_command(

@@ -110,19 +110,29 @@ class IntrabarResolver:
 
     `source = None` equivale a la política de la v1 en todos los casos, pero
     registra las velas con ambos niveles (`FALLBACK_NO_SOURCE`).
+
+    `fatal_errors` son los errores de la fuente que no admiten fallback (p. ej.
+    credenciales rechazadas): se propagan para no completar un backtest entero
+    con la política de la v1 creyendo que se usaron datos intradía.
     """
 
     def __init__(
         self,
         source: IntradayBarSource | None,
         price_tolerance: Decimal = DEFAULT_PRICE_TOLERANCE,
+        fatal_errors: tuple[type[Exception], ...] = (),
     ) -> None:
         if price_tolerance < 0:
             raise ValueError("price_tolerance no puede ser negativa")
 
         self._source = source
         self._tolerance = price_tolerance
+        self._fatal_errors = fatal_errors
         self._cache: dict[tuple[str, date], tuple[IntradayBar, ...] | str] = {}
+
+    @property
+    def source(self) -> IntradayBarSource | None:
+        return self._source
 
     @property
     def requested_sessions(self) -> int:
@@ -258,6 +268,9 @@ class IntrabarResolver:
                     )
                 )
             except Exception as error:  # fallback prudente ante cualquier fallo
+                if isinstance(error, self._fatal_errors):
+                    raise
+
                 self._cache[key] = f"{type(error).__name__}: {error}"
 
         return self._cache[key]

@@ -307,3 +307,17 @@ def test_each_session_is_downloaded_once() -> None:
 def test_negative_tolerance_is_rejected() -> None:
     with pytest.raises(ValueError, match="price_tolerance"):
         IntrabarResolver(None, price_tolerance=Decimal("-0.01"))
+
+
+class CredentialsRejected(Exception):
+    pass
+
+
+def test_fatal_source_errors_are_raised_instead_of_falling_back() -> None:
+    source = FakeSource(error=CredentialsRejected("401"))
+    resolver = IntrabarResolver(source, fatal_errors=(CredentialsRejected,))
+
+    with pytest.raises(CredentialsRejected):
+        resolve(resolver)
+
+    assert resolver.source is source

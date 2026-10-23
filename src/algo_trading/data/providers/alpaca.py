@@ -81,8 +81,45 @@ class AlpacaRequestError(AlpacaDataError):
     """Petición rechazada sin reintento (credenciales, parámetros: 4xx)."""
 
 
+class AlpacaAuthenticationError(AlpacaRequestError):
+    """Credenciales rechazadas (401 / 403): ninguna petición va a funcionar."""
+
+
 class AlpacaUnavailableError(AlpacaDataError):
     """Reintentos agotados por cuota (429), errores 5xx o de red."""
+
+
+class AlpacaRequestStats(BaseModel):
+    """
+    Telemetría de las peticiones HTTP de un proveedor.
+
+    `requests` cuenta cada intento (incluidos los reintentos); la latencia es
+    la de cada intento con respuesta. `rate_limit_*` es la cuota que informa
+    Alpaca (`X-RateLimit-Limit` / `-Remaining`): el mínimo de `remaining`
+    visto indica cuánto se acercó la ejecución al límite por minuto.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    requests: int = 0
+    successful: int = 0
+    rate_limited: int = 0
+    server_errors: int = 0
+    network_errors: int = 0
+    client_errors: int = 0
+    total_latency_ms: float = 0.0
+    max_latency_ms: float = 0.0
+    slept_seconds: float = 0.0
+    rate_limit_limit: int | None = None
+    min_rate_limit_remaining: int | None = None
+
+    @property
+    def responses(self) -> int:
+        return self.requests - self.network_errors
+
+    @property
+    def average_latency_ms(self) -> float | None:
+        return self.total_latency_ms / self.responses if self.responses else None
 
 
 class AlpacaCredentials(BaseModel):
@@ -176,6 +213,7 @@ class AlpacaMarketDataProvider:
         http_get: HttpGet | None = None,
         sleep: Callable[[float], None] | None = None,
         clock: Callable[[], datetime] | None = None,
+        timer: Callable[[], float] | None = None,
     ) -> None:
         if not 1 <= page_limit <= MAX_PAGE_LIMIT:
             raise ValueError(f"page_limit debe estar entre 1 y {MAX_PAGE_LIMIT}")
@@ -190,8 +228,10 @@ class AlpacaMarketDataProvider:
         self._http_get = http_get or urllib_get
         self._sleep = sleep or time.sleep
         self._clock = clock or (lambda: datetime.now(UTC))
+        self._timer = timer or time.perf_counter
         self._quota_reset: float | None = None
         self._rejected: list[RejectedAlpacaBar] = []
+        self._stats = AlpacaRequestStats()
 
     @property
     def source(self) -> str:
@@ -200,6 +240,10 @@ class AlpacaMarketDataProvider:
     @property
     def rejected_bars(self) -> tuple[RejectedAlpacaBar, ...]:
         return tuple(self._rejected)
+
+    @property
+    def stats(self) -> AlpacaRequestStats:
+        return self._stats
 
     def get_bars(self, request: DataRequest) -> Sequence[MarketBar]:
         if request.source != self.source:
@@ -289,13 +333,17 @@ class AlpacaMarketDataProvider:
         for attempt in range(self._retry.max_attempts):
             self._wait_for_quota()
 
+            started = self._timer()
+
             try:
                 response = self._http_get(url, headers, self._timeout)
             except (urllib.error.URLError, TimeoutError, OSError) as error:
+                self._count(network_errors=1)
                 last_error = f"error de red: {error}"
                 self._backoff(attempt)
                 continue
 
+            self._record_response(response, (self._timer() - started) * 1000)
             self._remember_quota(response.headers)
 
             if response.status == 200:
@@ -314,7 +362,12 @@ class AlpacaMarketDataProvider:
                 self._backoff(attempt)
                 continue
 
-            raise AlpacaRequestError(
+            error_type = (
+                AlpacaAuthenticationError
+                if response.status in (401, 403)
+                else AlpacaRequestError
+            )
+            raise error_type(
                 f"Alpaca rechazó la petición ({response.status}): "
                 + response.body.decode("utf-8", errors="replace")[:200]
             )
@@ -324,9 +377,53 @@ class AlpacaMarketDataProvider:
             f"{last_error}"
         )
 
+    def _count(self, **increments: int) -> None:
+        self._stats = self._stats.model_copy(
+            update={
+                "requests": self._stats.requests + 1,
+                **{
+                    name: getattr(self._stats, name) + value
+                    for name, value in increments.items()
+                },
+            }
+        )
+
+    def _record_response(self, response: HttpResponse, latency_ms: float) -> None:
+        status = response.status
+        self._count(
+            successful=int(status == 200),
+            rate_limited=int(status == 429),
+            server_errors=int(status >= 500),
+            client_errors=int(400 <= status < 500 and status != 429),
+        )
+        stats = self._stats
+        limit = _header_int(response.headers, "x-ratelimit-limit")
+        remaining = _header_int(response.headers, "x-ratelimit-remaining")
+        min_remaining = stats.min_rate_limit_remaining
+
+        if remaining is not None:
+            min_remaining = (
+                remaining if min_remaining is None else min(min_remaining, remaining)
+            )
+
+        self._stats = stats.model_copy(
+            update={
+                "total_latency_ms": stats.total_latency_ms + latency_ms,
+                "max_latency_ms": max(stats.max_latency_ms, latency_ms),
+                "rate_limit_limit": limit or stats.rate_limit_limit,
+                "min_rate_limit_remaining": min_remaining,
+            }
+        )
+
+    def _pause(self, seconds: float) -> None:
+        self._stats = self._stats.model_copy(
+            update={"slept_seconds": self._stats.slept_seconds + seconds}
+        )
+        self._sleep(seconds)
+
     def _backoff(self, attempt: int) -> None:
         if attempt + 1 < self._retry.max_attempts:
-            self._sleep(self._retry.delay(attempt))
+            self._pause(self._retry.delay(attempt))
 
     def _sleep_until_allowed(self, headers: Mapping[str, str], attempt: int) -> None:
         if attempt + 1 >= self._retry.max_attempts:
@@ -335,14 +432,14 @@ class AlpacaMarketDataProvider:
         retry_after = headers.get("retry-after")
 
         if retry_after is not None and retry_after.isdigit():
-            self._sleep(min(float(retry_after), self._retry.max_delay_seconds))
+            self._pause(min(float(retry_after), self._retry.max_delay_seconds))
             return
 
         if self._quota_reset is not None:
             self._wait_for_quota()
             return
 
-        self._sleep(self._retry.delay(attempt))
+        self._pause(self._retry.delay(attempt))
 
     def _remember_quota(self, headers: Mapping[str, str]) -> None:
         remaining = headers.get("x-ratelimit-remaining")
@@ -364,7 +461,7 @@ class AlpacaMarketDataProvider:
         self._quota_reset = None
 
         if wait > 0:
-            self._sleep(min(wait, self._retry.max_delay_seconds))
+            self._pause(min(wait, self._retry.max_delay_seconds))
 
     def _to_bar(
         self, symbol: str, row: Mapping[str, Any], timeframe: str
@@ -416,6 +513,10 @@ class AlpacaSessionBarSource:
         self._provider = provider
         self._calendar = calendar
 
+    @property
+    def provider(self) -> AlpacaMarketDataProvider:
+        return self._provider
+
     def get_session_bars(self, symbol: str, session_date: date) -> Sequence[MarketBar]:
         sessions = self._calendar.sessions(session_date, session_date)
 
@@ -442,6 +543,11 @@ class AlpacaSessionBarSource:
 def _rfc3339(value: datetime) -> str:
     aware = value if value.tzinfo is not None else value.replace(tzinfo=UTC)
     return aware.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _header_int(headers: Mapping[str, str], name: str) -> int | None:
+    value = headers.get(name, "").strip()
+    return int(value) if value.isdigit() else None
 
 
 def _quantize(value: Any) -> Decimal:
