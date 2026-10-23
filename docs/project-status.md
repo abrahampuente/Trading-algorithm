@@ -266,6 +266,67 @@ Marcas (UTC)                     envío local 21:40:55.598106 · POST ≈ 21:40:
 
 Cierre del Hito 3 (2026-10-23): pipeline completo broker + planificador + repositorio (`ExecutionService`) validado contra Alpaca Paper en frío (mercado cerrado): POST 411 ms, cancelación 392 ms, marcas `DATETIME(6)` en MySQL. Pasan al Hito 4: medir envío → fill con el mercado abierto, reconciliación de posiciones y ciclo entrada `OPG` → fill → OCO dentro del daemon.
 
+### Hito 4 (en curso): daemon de ejecución, reconciliación y telemetría
+
+Daemon (`execution/daemon.py`), probado con calendario y reloj simulados; todavía sin CLI ni ejecución en vivo:
+
+- `MarketClock` sobre `ExchangeCalendar` (NYSE): mercado abierto o cerrado, sesión actual, anterior y siguiente, próxima apertura y cierre y el tiempo hasta ellas (UTC, festivos y cierres tempranos). Verificado con el calendario real: próxima apertura 2026-10-26 13:30 UTC, Acción de Gracias 2026-11-26 cerrado, cierre temprano 2026-11-27 18:00 UTC.
+- `ExecutionDaemon` con tres tareas por sesión (`DaemonSchedule`):
+  - `pre_open`: una vez en `[apertura - 15 min, apertura)`; envía las órdenes `OPG` de la sesión. Si el daemon arranca con la sesión ya abierta, se marca `MISSED` y se alerta (las órdenes de apertura ya no valen).
+  - `intraday`: cada 60 s con el mercado abierto, desde apertura + 1 min; sincroniza órdenes y fills.
+  - `post_close`: una vez desde cierre + 15 min para la última sesión cerrada (también al arrancar fuera de sesión): reconciliación y métricas del día.
+  - Un fallo de tarea se registra (`JobRun`) y se alerta (`JOB_FAILED`) y el daemon sigue; `LiveTradingNotAllowedError` lo detiene en `HALTED`.
+  - Parada segura: SIGINT, SIGTERM y SIGBREAK (Windows) sólo activan un evento; la tarea en curso termina, no empieza ninguna nueva y el estado final es `STOPPED`. La espera entre ciclos (como mucho 5 min) usa ese evento, así que la parada es inmediata.
+- `ExecutionJobs`: tareas sobre `ExecutionService` con un `OrderPlanSource` (órdenes `OPG` por sesión; la generación de señales en vivo aún no está conectada).
+
+Reconciliación (`ExecutionService.reconcile_positions`):
+
+- Inventario local = compras menos ventas ejecutadas en `order_executions` (`BrokerOrderRepository.net_positions`), frente a `GET /v2/positions`. Antes sincroniza las órdenes abiertas.
+- Detecta: desajuste de inventario por símbolo (`INVENTORY_DRIFT`), órdenes con cantidad ejecutada sin ejecuciones registradas (`UNRECORDED_FILLS`), órdenes abiertas en el broker que no están en MySQL (`UNKNOWN_BROKER_ORDERS`) y órdenes abiertas en MySQL que el broker ya no tiene abiertas (`STALE_LOCAL_ORDERS`, sólo aviso).
+- Los tres primeros bloquean el envío de órdenes (`TradingHaltedError`, alerta `TRADING_HALTED`) hasta `resume()` manual; `pre_open` no envía nada y alerta `ORDERS_BLOCKED`.
+
+Telemetría (`telemetry/`):
+
+- Alertas: `Alert` (nivel, código, mensaje, detalles), `AlertEmitter` con varios destinos, `LogAlertSink` (una línea JSON por alerta en el logger `algo_trading.alerts`) y `MemoryAlertSink`.
+- Slippage: `signo · (ejecutado - referencia) / referencia · 10.000` en pb (positivo = adverso) y su coste; resumen con media, mediana, peor y media ponderada por nocional. La referencia por defecto es el precio teórico guardado; para las entradas `OPG` es el cierre de la señal, así que el slippage comparable con el backtest (apertura de `t+1`) exige pasar la apertura oficial en `reference_prices` una vez ingerida la barra.
+- Latencia acumulada de la API: `LatencyTracker` sobre `request_log` del broker; media, p50, p95, máximo y errores (sin respuesta, 429, 5xx).
+- Tasa de acierto de órdenes: de las cerradas, ejecutadas completas (`fill_rate`), parciales, no ejecutadas (OPG fuera de límite) y rechazadas.
+- `post_close` publica `DAILY_SUMMARY` con slippage, latencias p50 / p95, peticiones y errores de la API, `fill_rate` y órdenes abiertas.
+
+CLI `algo-live` (`cli/live.py`, entrada en `pyproject.toml`):
+
+```powershell
+algo-live --check-only            # alias --dry-run: verificaciones y estado del mercado, sin bucle
+algo-live --once                  # verificaciones y un único ciclo del daemon
+algo-live                         # daemon continuo; Ctrl+C / SIGTERM = parada segura
+algo-live --universe initial --log-level DEBUG
+```
+
+- Verificaciones de arranque: guardia de paper (`ALPACA_PAPER=true`, URL, clave `PK…`, cuenta `PA…` no bloqueada), MySQL accesible con la última migración (`alembic_version` = head del directorio de migraciones), reloj de mercado (abierto o tiempo hasta la próxima apertura / cierre), frescura de los datos diarios del universo frente a la última sesión cerrada (aviso) y reconciliación inicial.
+- Códigos de salida: 0 correcto, 1 verificación fallida (no se arranca), 2 desajuste de reconciliación (`--check-only` / `--once`; en modo continuo el daemon arranca con el envío bloqueado).
+- Log en UTC (`…Z`), alertas como JSON; salida forzada a UTF-8 en Windows.
+- `ExecutionDaemon.graceful_shutdown()`: la usan los manejadores de SIGINT / SIGTERM / SIGBREAK.
+- El plan de órdenes aún está vacío (`NoOrderPlan`): `pre_open` no envía órdenes hasta conectar la generación desde señales.
+- Tests: argumentos, `--check-only` (mercado abierto y cerrado, desajuste, cuenta no paper o bloqueada, guardia, migración pendiente, universo desconocido), `--once`, modo continuo con Ctrl+C simulado y frescura de datos.
+
+Ejecución real (2026-10-23 22:00 UTC, viernes tras el cierre):
+
+```text
+Cuenta Alpaca: PA… ACTIVE  equity 100,000.00 USD  poder de compra 400,000.00
+MySQL: migración b7c8d9e0f1a2
+Universo: diversified (15 símbolos)
+Mercado: CERRADO; próxima apertura 2026-10-26 13:30 UTC, en 2 d 15 h 29 min
+Datos diarios: AVISO, no llegan a 2026-10-23 (última barra 2026-10-22 en los 15 símbolos)
+Reconciliación: OK; posiciones broker: ninguna
+--once → post_close OK: RECONCILIATION_OK y DAILY_SUMMARY (5 peticiones, p50 466-513 ms, p95 504-644 ms, 0 errores,
+         0 órdenes abiertas; fill_rate 0 por la única orden cerrada, la de la prueba de latencia cancelada)
+```
+
+- El aviso de datos es correcto: `algo-ingest` ingiere por defecto hasta ayer en UTC, así que la barra del viernes no entra hasta el sábado. El pipeline en vivo deberá ingerir el cierre del día antes de calcular señales.
+- No se ha probado todavía el modo continuo contra los servicios reales (sí con Ctrl+C simulado en tests).
+
+Pendiente en el Hito 4: plan de órdenes desde las señales del cierre (ingesta del día, señales, allocator con el equity del broker, planificador); notificaciones Telegram / Discord; persistir alertas, métricas y latencias; primera sesión completa en paper con el mercado abierto.
+
 
 ## v1 cerrada (2026-10-23)
 

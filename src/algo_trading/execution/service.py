@@ -15,6 +15,13 @@ refleja siempre lo que ya se envió al broker; ante un error deshace la
 transacción en curso y lo propaga.
 
 Envío idempotente: si `client_order_id` ya está guardado, no se reenvía.
+
+Reconciliación (`reconcile_positions`): compara el inventario local
+(compras menos ventas de `order_executions`) con las posiciones del broker y
+las órdenes abiertas de ambos lados. Un desajuste de inventario, fills sin
+registrar u órdenes abiertas en el broker que no están en MySQL bloquean el
+envío de nuevas órdenes (`TradingHaltedError`) hasta `resume()`; cada hallazgo
+genera una alerta.
 """
 
 import time
@@ -31,11 +38,13 @@ from algo_trading.execution.broker import BrokerAdapter
 from algo_trading.execution.order_planner import OrderPlanner
 from algo_trading.execution.orders import OrderRequest, OrderState
 from algo_trading.persistence.repositories.broker_order_repository import (
+    BrokerOrderRecord,
     BrokerOrderRepository,
     OrderSyncResult,
     UnknownOrderError,
 )
 from algo_trading.portfolio.allocator import PlannedEntry
+from algo_trading.telemetry.alerts import AlertEmitter, AlertLevel
 
 # Estados de Alpaca en los que el broker ya aceptó la orden (`pending_new`
 # todavía no).
@@ -89,6 +98,42 @@ class StatusWaitResult(BaseModel):
     transitions: tuple[OrderSyncResult, ...]
 
 
+class TradingHaltedError(RuntimeError):
+    """El envío de órdenes está bloqueado tras un desajuste de reconciliación."""
+
+
+class PositionDrift(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    symbol: str
+    local_quantity: Decimal
+    broker_quantity: Decimal
+
+    @property
+    def difference(self) -> Decimal:
+        return self.broker_quantity - self.local_quantity
+
+
+class ReconciliationReport(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    checked_at: datetime
+    local_positions: dict[str, Decimal]
+    broker_positions: dict[str, Decimal]
+    drifts: tuple[PositionDrift, ...]
+    unrecorded_fills: tuple[str, ...]
+    unknown_broker_orders: tuple[str, ...]
+    stale_local_orders: tuple[str, ...]
+
+    @property
+    def requires_halt(self) -> bool:
+        return bool(self.drifts or self.unrecorded_fills or self.unknown_broker_orders)
+
+    @property
+    def is_consistent(self) -> bool:
+        return not (self.requires_halt or self.stale_local_orders)
+
+
 class ExecutionService:
     def __init__(
         self,
@@ -107,8 +152,25 @@ class ExecutionService:
         self._repository = repository or BrokerOrderRepository(session, self._clock)
         self._timer = timer or time.perf_counter
         self._sleep = sleep or time.sleep
+        self._halt_reason: str | None = None
+
+    @property
+    def halt_reason(self) -> str | None:
+        return self._halt_reason
+
+    def halt(self, reason: str) -> None:
+        self._halt_reason = reason
+
+    def resume(self) -> None:
+        """Desbloquea el envío; hágalo sólo tras revisar el desajuste."""
+        self._halt_reason = None
 
     def submit(self, request: OrderRequest) -> DispatchResult:
+        if self._halt_reason is not None:
+            raise TradingHaltedError(
+                f"Envío bloqueado ({request.client_order_id}): {self._halt_reason}"
+            )
+
         existing = self._repository.get(request.client_order_id)
 
         if existing is not None:
@@ -199,6 +261,77 @@ class ExecutionService:
         self._broker.cancel_order(stored.broker_order_id)
         return self.sync(client_order_id)
 
+    def order_records(
+        self, since: datetime | None = None
+    ) -> tuple[BrokerOrderRecord, ...]:
+        """Órdenes guardadas (para métricas operativas), opcionalmente desde `since`."""
+        return self._repository.list_records(since)
+
+    def reconcile_positions(
+        self,
+        alerts: AlertEmitter | None = None,
+        sync_first: bool = True,
+    ) -> ReconciliationReport:
+        """
+        Inventario local frente a posiciones del broker. Con `sync_first`,
+        sincroniza antes las órdenes abiertas para registrar fills recientes.
+        """
+        if sync_first:
+            self.sync_open_orders()
+
+        local = self._repository.net_positions()
+        broker = {
+            position.symbol: position.quantity
+            for position in self._broker.get_positions()
+            if position.quantity != 0
+        }
+        drifts = tuple(
+            PositionDrift(
+                symbol=symbol,
+                local_quantity=local.get(symbol, Decimal("0")),
+                broker_quantity=broker.get(symbol, Decimal("0")),
+            )
+            for symbol in sorted(set(local) | set(broker))
+            if local.get(symbol, Decimal("0")) != broker.get(symbol, Decimal("0"))
+        )
+        unrecorded = tuple(
+            record.state.client_order_id
+            for record in self._repository.list_records()
+            if record.state.filled_quantity
+            != sum(
+                (
+                    execution.quantity
+                    for execution in self._repository.get_executions(
+                        record.state.client_order_id
+                    )
+                ),
+                Decimal("0"),
+            )
+        )
+        broker_open = {
+            order.client_order_id
+            for root in self._broker.list_open_orders()
+            for order in (root, *root.legs)
+        }
+        local_open = {order.client_order_id for order in self._repository.list_open()}
+        report = ReconciliationReport(
+            checked_at=self._clock(),
+            local_positions=local,
+            broker_positions=broker,
+            drifts=drifts,
+            unrecorded_fills=unrecorded,
+            unknown_broker_orders=tuple(sorted(broker_open - local_open)),
+            stale_local_orders=tuple(sorted(local_open - broker_open)),
+        )
+
+        if report.requires_halt:
+            self.halt("desajuste de reconciliación")
+
+        if alerts is not None:
+            _emit_reconciliation_alerts(alerts, report)
+
+        return report
+
     def wait_for_status(
         self,
         client_order_id: str,
@@ -257,3 +390,59 @@ class ExecutionService:
             return self._broker.request_log[start:]
 
         return ()
+
+
+def _emit_reconciliation_alerts(
+    alerts: AlertEmitter, report: ReconciliationReport
+) -> None:
+    for drift in report.drifts:
+        alerts.emit(
+            AlertLevel.CRITICAL,
+            "INVENTORY_DRIFT",
+            f"{drift.symbol}: local {drift.local_quantity}, broker "
+            f"{drift.broker_quantity}",
+            {
+                "symbol": drift.symbol,
+                "local_quantity": str(drift.local_quantity),
+                "broker_quantity": str(drift.broker_quantity),
+                "difference": str(drift.difference),
+            },
+        )
+
+    if report.unrecorded_fills:
+        alerts.emit(
+            AlertLevel.CRITICAL,
+            "UNRECORDED_FILLS",
+            "Órdenes con cantidad ejecutada sin ejecuciones registradas",
+            {"client_order_ids": list(report.unrecorded_fills)},
+        )
+
+    if report.unknown_broker_orders:
+        alerts.emit(
+            AlertLevel.CRITICAL,
+            "UNKNOWN_BROKER_ORDERS",
+            "Órdenes abiertas en el broker que no están en MySQL",
+            {"client_order_ids": list(report.unknown_broker_orders)},
+        )
+
+    if report.stale_local_orders:
+        alerts.emit(
+            AlertLevel.WARNING,
+            "STALE_LOCAL_ORDERS",
+            "Órdenes abiertas en MySQL que el broker ya no tiene abiertas",
+            {"client_order_ids": list(report.stale_local_orders)},
+        )
+
+    if report.requires_halt:
+        alerts.emit(
+            AlertLevel.CRITICAL,
+            "TRADING_HALTED",
+            "Envío de órdenes bloqueado hasta revisar la reconciliación",
+        )
+    elif report.is_consistent:
+        alerts.emit(
+            AlertLevel.INFO,
+            "RECONCILIATION_OK",
+            "Inventario local y broker coinciden",
+            {"positions": {k: str(v) for k, v in report.local_positions.items()}},
+        )

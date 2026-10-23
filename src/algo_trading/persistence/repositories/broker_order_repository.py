@@ -3,7 +3,7 @@ from datetime import UTC, datetime
 from decimal import ROUND_HALF_EVEN, Decimal, localcontext
 
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from algo_trading.execution.orders import (
@@ -206,6 +206,47 @@ class BrokerOrderRepository:
             .order_by(BrokerOrderModel.created_at, BrokerOrderModel.id)
         ).all()
         return tuple(self._to_state(row) for row in rows)
+
+    def list_records(
+        self, since: datetime | None = None
+    ) -> tuple[BrokerOrderRecord, ...]:
+        """Órdenes guardadas (incluidas patas), opcionalmente desde `since`."""
+        query = select(BrokerOrderModel).order_by(
+            BrokerOrderModel.created_at, BrokerOrderModel.id
+        )
+
+        if since is not None:
+            query = query.where(BrokerOrderModel.created_at >= _to_db(since))
+
+        return tuple(self._to_record(row) for row in self._session.scalars(query))
+
+    def net_positions(self) -> dict[str, Decimal]:
+        """
+        Inventario local por símbolo: compras menos ventas ejecutadas según
+        `order_executions`. Los símbolos con saldo cero no aparecen.
+        """
+        rows = self._session.execute(
+            select(
+                BrokerOrderModel.symbol,
+                BrokerOrderModel.side,
+                func.sum(OrderExecutionModel.quantity),
+            )
+            .join(BrokerOrderModel, BrokerOrderModel.id == OrderExecutionModel.order_id)
+            .group_by(BrokerOrderModel.symbol, BrokerOrderModel.side)
+        ).all()
+        positions: dict[str, Decimal] = {}
+
+        for symbol, side, quantity in rows:
+            signed = (
+                Decimal(quantity) if side == OrderSide.BUY.value else -Decimal(quantity)
+            )
+            positions[symbol] = positions.get(symbol, Decimal("0")) + signed
+
+        return {
+            symbol: quantity.quantize(QUANTUM)
+            for symbol, quantity in sorted(positions.items())
+            if quantity != 0
+        }
 
     def get_executions(self, client_order_id: str) -> tuple[OrderExecution, ...]:
         rows = self._session.execute(
