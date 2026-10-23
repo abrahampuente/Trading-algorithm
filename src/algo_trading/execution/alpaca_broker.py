@@ -26,7 +26,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable, Mapping, Sequence
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
@@ -66,6 +66,18 @@ class OrderRejectedError(BrokerError):
 
 class BrokerUnavailableError(BrokerError):
     """Reintentos agotados por cuota, errores 5xx o de red."""
+
+
+class RequestTiming(BaseModel):
+    """Petición HTTP al broker: `latency_ms` = envío → respuesta (red + API)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    method: str
+    path: str
+    status: int | None  # None: error de red sin respuesta
+    started_at: datetime
+    latency_ms: float
 
 
 class AlpacaTradingCredentials(BaseModel):
@@ -166,6 +178,8 @@ class AlpacaPaperBroker:
         timeout_seconds: float = 30.0,
         http_send: HttpSend | None = None,
         sleep: Callable[[float], None] | None = None,
+        clock: Callable[[], datetime] | None = None,
+        timer: Callable[[], float] | None = None,
     ) -> None:
         self._guard = PaperTradingGuard(paper_flag, base_url, credentials.key_id)
         self._guard.check_configuration()
@@ -175,6 +189,9 @@ class AlpacaPaperBroker:
         self._timeout = timeout_seconds
         self._send = http_send or urllib_send
         self._sleep = sleep or time.sleep
+        self._clock = clock or (lambda: datetime.now(UTC))
+        self._timer = timer or time.perf_counter
+        self._request_log: list[RequestTiming] = []
         self._account_verified = False
 
     def get_account(self) -> AccountSnapshot:
@@ -210,7 +227,7 @@ class AlpacaPaperBroker:
 
         for attempt in range(self._retry.max_attempts):
             try:
-                response = self._send(
+                response = self._timed_send(
                     "POST",
                     f"{self._base_url}/v2/orders",
                     self._headers(json_body=True),
@@ -278,7 +295,7 @@ class AlpacaPaperBroker:
 
         for attempt in range(self._retry.max_attempts):
             try:
-                response = self._send(
+                response = self._timed_send(
                     "DELETE", url, self._headers(), None, self._timeout
                 )
             except OSError:
@@ -299,6 +316,38 @@ class AlpacaPaperBroker:
 
         raise BrokerUnavailableError(f"No se pudo cancelar {broker_order_id}")
 
+    @property
+    def request_log(self) -> tuple[RequestTiming, ...]:
+        """Cada petición HTTP enviada, con su latencia (incluidos reintentos)."""
+        return tuple(self._request_log)
+
+    def _timed_send(
+        self,
+        method: str,
+        url: str,
+        headers: Mapping[str, str],
+        body: bytes | None,
+        timeout: float,
+    ) -> HttpResponse:
+        started_at = self._clock()
+        started = self._timer()
+        status: int | None = None
+
+        try:
+            response = self._send(method, url, headers, body, timeout)
+            status = response.status
+            return response
+        finally:
+            self._request_log.append(
+                RequestTiming(
+                    method=method,
+                    path=urllib.parse.urlparse(url).path,
+                    status=status,
+                    started_at=started_at,
+                    latency_ms=(self._timer() - started) * 1000,
+                )
+            )
+
     def _ensure_paper(self) -> None:
         self._guard.check_configuration()
 
@@ -318,7 +367,9 @@ class AlpacaPaperBroker:
 
         for attempt in range(self._retry.max_attempts):
             try:
-                response = self._send("GET", url, self._headers(), None, self._timeout)
+                response = self._timed_send(
+                    "GET", url, self._headers(), None, self._timeout
+                )
             except OSError as error:
                 last_error = f"error de red: {error}"
                 self._backoff(attempt)

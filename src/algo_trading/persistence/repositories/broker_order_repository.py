@@ -90,12 +90,16 @@ class BrokerOrderRepository:
         self._clock = clock or (lambda: datetime.now(UTC))
 
     def record_submission(
-        self, request: OrderRequest, state: OrderState
+        self,
+        request: OrderRequest,
+        state: OrderState,
+        created_at: datetime | None = None,
     ) -> OrderSyncResult:
+        """`created_at`: momento local del envío (por defecto, ahora)."""
         if request.client_order_id != state.client_order_id:
             raise ValueError("La solicitud y el estado son de órdenes distintas")
 
-        result = self.apply_state(state)
+        result = self.apply_state(state, created_at=created_at)
         row = self._row(state.client_order_id)
         assert row is not None
         row.theoretical_price = _quantize(request.theoretical_price)
@@ -111,6 +115,7 @@ class BrokerOrderRepository:
         state: OrderState,
         parent_client_order_id: str | None = None,
         deduce_executions: bool = True,
+        created_at: datetime | None = None,
     ) -> OrderSyncResult:
         now = _to_db(self._clock())
         assert now is not None
@@ -124,7 +129,7 @@ class BrokerOrderRepository:
                 parent_client_order_id=parent_client_order_id,
                 filled_quantity=Decimal("0"),
                 filled_average_price=None,
-                created_at=now,
+                created_at=_to_db(created_at) or now,
             )
             self._session.add(row)
         else:

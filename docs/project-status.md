@@ -9,8 +9,8 @@ Roadmap v2:
 ```text
 Hito 1  Especificación v2 y motor de señales multi-factor          parcial (filtros de régimen; Short pendiente)
 Hito 2  Proveedor intradía y simulación exacta intrabarra           validado con Alpaca real
-Hito 3  Adaptador de broker en Sandbox (paper) y motor de órdenes   en curso
-Hito 4  Scheduler diario/intradía, latencia y notificaciones        pendiente
+Hito 3  Adaptador de broker en Sandbox (paper) y motor de órdenes   cerrado (pipeline validado en frío)
+Hito 4  Scheduler diario/intradía, latencia y notificaciones        en curso
 Hito 5  Paper trading en vivo de 30-60 sesiones                     pendiente
 ```
 
@@ -185,7 +185,7 @@ SL × ATR  TP × ATR  Trades  Conflictos  Necesitan datos intradía
 
 Hito 2 cerrado en cuanto a datos intradía y resolución intrabarra. Pendiente (pasa a trabajos posteriores): persistir las barras de 1 minuto descargadas como snapshots (`market_bars_raw`, timeframe `1m`); correlación de cartera y costes dinámicos (más relevantes para la v1 que la resolución intrabarra, a la vista de los conflictos).
 
-### Hito 3 (en curso): conector de órdenes Alpaca Paper
+### Hito 3 (cerrado): conector de órdenes y pipeline de ejecución Alpaca Paper
 
 Núcleo completado: conector `AlpacaPaperBroker`, guardia estricta de paper trading y `OrderPlanner`. Módulos nuevos en `execution/` (todavía no los usa ningún pipeline ni la CLI; verificados sólo con respuestas simuladas, sin órdenes reales enviadas):
 
@@ -230,7 +230,41 @@ order_executions  id, order_id (FK broker_orders, ON DELETE CASCADE), execution_
   - `get`, `get_record`, `list_open` (estados no finales, incluidas patas), `get_executions`.
 - Tests: SQLite (ciclo completo con fills parciales, cancelación tras fill parcial, OPG no ejecutada, OCO con patas, transiciones inválidas, idempotencia) e integración en MySQL (esquema real, unicidad de `client_order_id`, cascada, microsegundos).
 
-Pendiente en el Hito 3: conectar broker, planificador y repositorio en un servicio de envío y sincronización; reconciliación con las posiciones del broker; primer ciclo manual en la cuenta paper (envío, fill, OCO, cancelación).
+Servicio de ejecución (`execution/service.py`, `ExecutionService`):
+
+- Une `BrokerAdapter` (Alpaca Paper), `OrderPlanner` y `BrokerOrderRepository`; confirma la transacción tras cada operación (MySQL refleja lo ya enviado) y la deshace si algo falla.
+- `submit` (idempotente: un `client_order_id` ya guardado no se reenvía), `dispatch_entries` (compras `OPG` desde `PlannedEntry`), `dispatch_protective_exit` (OCO con niveles sobre el precio ejecutado), `dispatch_time_exit`, `sync` / `sync_open_orders` (estado del broker → `apply_state`, que registra los fills), `cancel` y `wait_for_status` (sondeo hasta un estado del broker o timeout, registrando cada cambio).
+- Tiempos: `SubmissionTiming` con envío local y respuesta (UTC, microsegundos), duración total de `submit_order` y la latencia de cada petición HTTP (`AlpacaPaperBroker.request_log`: método, ruta, estado, latencia en ms).
+- `created_at` de `broker_orders` = momento local del envío.
+
+Primera orden real en Alpaca Paper (2026-10-23 21:40 UTC, mercado cerrado):
+
+- Orden: compra limitada `day` de 1 SPY a 381,98 USD (50 % del último cierre, 763,96), imposible de ejecutar; cancelada a continuación. La cuenta paper queda sin órdenes abiertas ni posiciones.
+- Guardia: `ALPACA_PAPER=true`, URL de paper, clave `PK…` y cuenta `PA…` (ACTIVE, sin bloqueo) verificadas antes del envío.
+
+```text
+Petición                         Latencia (red + API)
+GET  /v2/account (guardia)       516.1 ms   (sólo en la primera orden)
+POST /v2/orders                  411.4 ms   → respuesta "accepted"
+GET  /v2/orders:by_client_order_id (confirmación)  ≈ 406 ms
+DELETE /v2/orders/{id}           392.1 ms
+GET  (cancelación confirmada)    ≈ 507 ms
+7 peticiones: mín. 382 ms, mediana 461 ms, máx. 563 ms
+
+Envío → aceptada                 411 ms (el propio POST devuelve "accepted": fuera de sesión,
+                                 Alpaca acepta y encola la orden para la apertura)
+submit_order completo            928 ms (incluye la verificación de la cuenta)
+Envío → confirmación por sondeo  1.334 ms (una consulta adicional)
+Cancelación → "canceled"         508 ms (una consulta)
+
+Marcas (UTC)                     envío local 21:40:55.598106 · POST ≈ 21:40:56.114
+                                 submitted_at del broker 21:40:56.353047 · respuesta 21:40:56.526016
+```
+
+- Fila en `broker_orders` (id 13) con todas las marcas en `DATETIME(6)`: `created_at` 21:40:55.598106, `submitted_at` 21:40:56.353047, `broker_updated_at` 21:40:57.183099, `last_synced_at` 21:40:58.428287; estado `CANCELED` / `canceled`; 0 ejecuciones.
+- Lectura: la latencia de la API es de ≈0,4-0,5 s por petición desde este equipo, dominada por la red (el broker marca `submitted_at` ≈240 ms después del envío del POST y la respuesta llega ≈170 ms después; las diferencias entre relojes local y del broker no se corrigen). Para entradas `OPG` enviadas al cierre no es relevante; el tiempo hasta el fill sólo se podrá medir con el mercado abierto.
+
+Cierre del Hito 3 (2026-10-23): pipeline completo broker + planificador + repositorio (`ExecutionService`) validado contra Alpaca Paper en frío (mercado cerrado): POST 411 ms, cancelación 392 ms, marcas `DATETIME(6)` en MySQL. Pasan al Hito 4: medir envío → fill con el mercado abierto, reconciliación de posiciones y ciclo entrada `OPG` → fill → OCO dentro del daemon.
 
 
 ## v1 cerrada (2026-10-23)

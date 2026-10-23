@@ -505,3 +505,34 @@ def test_unfilled_opening_order_ends_canceled_or_expired(
     assert order is not None
     assert order.status is expected
     assert order.filled_quantity == 0
+
+
+def test_request_log_times_every_http_call() -> None:
+    ticks = iter([0.0, 0.080, 1.0, 1.250])
+    transport = FakeTransport(
+        response(200, account()), response(200, order_json(status="new"))
+    )
+    paper = AlpacaPaperBroker(
+        CREDENTIALS,
+        paper_flag="true",
+        http_send=transport,
+        sleep=[].append,
+        timer=lambda: next(ticks),
+    )
+
+    paper.submit_order(ENTRY)
+
+    assert [(r.method, r.path, r.status) for r in paper.request_log] == [
+        ("GET", "/v2/account", 200),
+        ("POST", "/v2/orders", 200),
+    ]
+    assert [r.latency_ms for r in paper.request_log] == pytest.approx([80, 250])
+
+
+def test_request_log_records_network_errors_without_status() -> None:
+    transport = FakeTransport(OSError("sin red"), response(200, account()))
+    paper = broker(transport)
+
+    paper.get_account()
+
+    assert [r.status for r in paper.request_log] == [None, 200]
