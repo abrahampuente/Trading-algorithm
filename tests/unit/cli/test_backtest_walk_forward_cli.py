@@ -131,3 +131,67 @@ def test_walk_forward_command_writes_report_without_persisting(
 
     with Session(engine) as session:
         assert session.query(BacktestRunModel).count() == 0
+
+
+def test_portfolio_scaling_options_and_report_tag(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    arguments = parse_args(
+        [
+            "--walk-forward",
+            "--symbols",
+            "AAA",
+            "BBB",
+            "--start",
+            "2022-01-01",
+            "--end",
+            "2023-12-31",
+            "--is-months",
+            "6",
+            "--oos-months",
+            "3",
+            "--min-trades",
+            "1",
+            "--sl-multiples",
+            "1.5",
+            "--tp-multiples",
+            "3",
+            "--exposures",
+            "0.10",
+            "--positions-grid",
+            "2",
+            "5",
+            "--risk-grid",
+            "0.005",
+            "0.01",
+            "--report-tag",
+            "portfolio_scaling",
+            "--output-dir",
+            str(tmp_path),
+        ]
+    )
+
+    report, json_path, markdown_path = run_walk_forward_command(
+        arguments,
+        session_factory=sessionmaker(bind=engine),
+        settings=ApplicationSettings.from_yaml(),
+        calendar=None,
+    )
+
+    assert len(report.config.grid.combinations()) == 4
+    assert len(report.scaling_study) == 4
+    assert json_path.name.startswith("walk_forward_portfolio_scaling_AAA-BBB_")
+    assert "## Escalado de cartera" in markdown_path.read_text(encoding="utf-8")
+    assert "Escalado de cartera" in format_walk_forward_summary(
+        report, json_path, markdown_path
+    )
+
+
+def test_grid_defaults_to_base_portfolio_scale() -> None:
+    arguments = parse_args(["--max-positions", "8", "--risk-per-trade", "0.01"])
+
+    assert arguments.positions_grid is None
+    assert arguments.risk_grid is None
+    assert arguments.max_positions == 8
+    assert arguments.risk_per_trade == Decimal("0.01")

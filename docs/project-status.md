@@ -777,6 +777,48 @@ Lectura:
 - La ventana 2026 (parcial) casi no gana (WFE 3 %): el WFE global depende de pocas ventanas y conviene seguirlo con más historia.
 - Aun así, Buy & Hold diversificado (108,8 %) supera ampliamente a la estrategia (11,7 %) en este periodo alcista, con un MDD mucho mayor (15,3 %). El 72 % del capital sigue ocioso: el límite de 5 posiciones y el riesgo de 0,5 % por operación son ahora el principal freno al retorno absoluto.
 
+### Escalado de cartera y riesgo en walk-forward
+
+Rejilla:
+
+- `ParameterCombination` y `ParameterGrid` añaden `max_positions` y `risk_per_trade` (por defecto 5 y 0,5 %: la rejilla anterior no cambia). Orden: SL → TP → exposición → posiciones → riesgo. `scale_levels()` devuelve los pares (posiciones, riesgo).
+- CLI: `--positions-grid`, `--risk-grid` (ejes de la rejilla), `--max-positions`, `--risk-per-trade` (ejecuciones individuales) y `--report-tag` (etiqueta en el nombre del informe). `build_grid` construye la rejilla para barrido y walk-forward.
+
+Walk-forward:
+
+- La rejilla IS se evalúa una sola vez por ventana. El walk-forward principal elige entre todas las combinaciones; el estudio de escalado (`PortfolioScaleResult`, informe `walk-forward-report-v3`) repite sólo la selección restringida a cada nivel (posiciones, riesgo) y encadena su OOS. Un test comprueba que cada nivel coincide con un walk-forward ejecutado sólo con ese nivel.
+- Rendimiento: las señales se calculan una vez sobre todo el historial (`WalkForwardAnalyzer.signals`) y el motor las recibe con `precomputed_signals`; son invariantes a barras futuras, así que el resultado es idéntico (test de equivalencia y walk-forward diversificado anterior reproducido exactamente: 11,66 %, WFE 89,82 %) y unas 10 veces más rápido (201 s → 19 s).
+- Métrica nueva por periodo: `average_open_positions`.
+
+Ejecución:
+
+```powershell
+algo-backtest --walk-forward --universe diversified --sl-multiples 1.5 2.0 --tp-multiples 2.5 3.0 `
+  --exposures 0.10 0.15 0.20 --positions-grid 5 8 10 --risk-grid 0.005 0.010 0.015 --report-tag portfolio_scaling
+```
+
+Informe: `reports/walk_forward_portfolio_scaling_diversified_2020-01-01_2026-10-22_base_is36-oos12_profit_factor.md` (108 combinaciones por ventana, 9 niveles, 89 s).
+
+```text
+Pos.  Riesgo  Riesgo máx.  Retorno OOS  MDD     Sharpe  Exposición  Pos. medias  Trades  WFE
+5     0,5 %    2,5 %       11.01 %      4.23 %  0.65    27.60 %     2.01         202     119.56 %
+5     1,0 %    5,0 %       14.05 %      5.49 %  0.64    33.46 %     2.06         198     131.63 %
+5     1,5 %    7,5 %        6.92 %      7.28 %  0.39    25.37 %     2.01         202      80.09 %
+8     0,5 %    4,0 %        7.96 %      5.12 %  0.47    27.64 %     2.08         218      90.60 %
+8     1,0 %    8,0 %        5.45 %      7.14 %  0.30    28.09 %     2.07         217      67.12 %
+8     1,5 %   12,0 %        5.30 %      7.28 %  0.29    28.04 %     2.05         216      61.94 %
+10    (idéntico a 8 posiciones en los tres niveles de riesgo)
+Optimizado (108 comb.)      9.48 %      5.49 %  0.52    29.49 %     2.02         204      92.65 %
+Buy & Hold diversificado OOS: 108.77 % (MDD 15.27 %)
+```
+
+Diagnóstico del capital ocioso:
+
+- No faltan plazas: la media es de 2 posiciones abiertas y sólo el 5,8 % de las sesiones OOS llega a 5. Con 8 o 10 plazas apenas entran operaciones nuevas (≈+15 trades) y son de peor calidad; 8 y 10 dan resultados idénticos.
+- El riesgo por operación casi no cambia el tamaño: la mediana de ATR/precio en la entrada es 1,58 % (p90 2,41 %). Con SL de 1,5-2 × ATR, el riesgo por unidad es ≈2,4-3,2 % del precio, de modo que 0,5 % de riesgo ya pide ≈20 % del equity por posición y el tope de exposición (10-20 %) es el que limita. Subir el riesgo sólo amplía las posiciones de ATR alto y empeora el MDD (7,3 % con 1,5 %).
+- Optimizar también la escala (108 combinaciones) da menos que fijar 5 posiciones (9,48 % frente a 11-14 %): más grados de libertad añaden ruido de selección aunque el WFE siga alto.
+- Conclusión: el cuello de botella es la frecuencia de señales × el tope de exposición por posición, no el número de plazas ni el riesgo. Mantener 5 posiciones y 0,5-1,0 % de riesgo (con 1,0 % se supera el límite teórico de 2,5 % de la especificación v1: 5 %). Las palancas útiles son la exposición máxima por posición y más señales.
+
 ### Métricas e informes (Hito 4)
 
 `calculate_performance_metrics(result, bars_by_symbol)` (`analytics/metrics.py`):
@@ -1103,10 +1145,11 @@ Completado:
 - Multiplicador de stop loss configurable y barrido de parámetros (SL × exposición) persistido con `sweep_id`.
 - Walk-Forward Optimization con curva OOS encadenada y Eficiencia Walk-Forward (`--walk-forward`).
 - Universo diversificado (15 símbolos) ingerido; rejilla con eje de TP; walk-forward con uso de capital y Buy & Hold diversificado.
+- Escalado de cartera (posiciones y riesgo) en la rejilla y estudio de escalado por nivel en el walk-forward; señales precalculadas (≈10× más rápido).
 
 Orden inmediato:
 
-1. Uso del capital ocioso: evaluar en walk-forward más posiciones simultáneas y mayor riesgo por operación sobre el universo diversificado (manteniendo el MDD acotado), e incluir el umbral anti-gap en la rejilla.
+1. Capital ocioso: evaluar en walk-forward topes de exposición por posición mayores (25-35 %) con 5 posiciones, y fuentes de más señales (universo más amplio, umbral anti-gap en la rejilla), manteniendo el MDD acotado.
 2. Reintentos con backoff para el proveedor real y validación de calidad de datos (saltos de precio, volumen cero).
 3. Decidir proveedor y granularidad intradía antes de implementar su adaptador y la simulación intradía (usando horarios y cierres tempranos del calendario).
 
@@ -1125,9 +1168,9 @@ Python: 3.13.3
 Sistema operativo: Windows 11
 IDE: VS Code
 Base de datos: MySQL 8.0 mediante Docker Compose
-Estado: v1 completa en datos diarios: ingesta real, calendario NYSE, dividendos, indicadores, señales Long, gestión monetaria, backtesting persistido, perfiles de costes, barridos de parámetros, walk-forward sobre universo diversificado, métricas e informes
+Estado: v1 completa en datos diarios: ingesta real, calendario NYSE, dividendos, indicadores, señales Long, gestión monetaria, backtesting persistido, perfiles de costes, barridos de parámetros, walk-forward sobre universo diversificado con estudio de escalado de cartera, métricas e informes
 Validaciones: pytest, ruff y mypy están en verde
-Siguiente tarea: aprovechar el capital ocioso (posiciones simultáneas y riesgo por operación) en walk-forward
+Siguiente tarea: topes de exposición por posición mayores y más señales en walk-forward
 Fuente de verdad: docs/project-status.md
 ```
 
@@ -1141,8 +1184,8 @@ ruff format --check .
 mypy src
 ```
 
-No regenerar módulos ya implementados. Continuar desde el aprovechamiento del capital ocioso en el walk-forward diversificado.
+No regenerar módulos ya implementados. Continuar desde la evaluación de topes de exposición mayores y más señales en el walk-forward diversificado.
 
 Al abrir el siguiente chat, bastará con indicar:
 
-> Este proyecto continúa desde `docs/project-status.md`. Lee ese estado y no regeneres módulos ya implementados. El siguiente paso es evaluar en walk-forward más posiciones simultáneas y mayor riesgo por operación sobre el universo diversificado.
+> Este proyecto continúa desde `docs/project-status.md`. Lee ese estado y no regeneres módulos ya implementados. El siguiente paso es evaluar en walk-forward topes de exposición por posición mayores (con 5 posiciones) y fuentes de más señales.

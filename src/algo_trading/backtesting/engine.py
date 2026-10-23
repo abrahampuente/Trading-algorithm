@@ -154,6 +154,13 @@ class BacktestEngine:
     esa fecha. Permite evaluar una ventana (p. ej. walk-forward) con los
     indicadores ya calentados y sin usar datos posteriores a la ventana, que
     se limita pasando sólo las barras hasta su fin.
+
+    `precomputed_signals` evita recalcular las señales en ejecuciones
+    repetidas (barridos, walk-forward). Deben generarse con los mismos
+    `signal` parámetros sobre una serie que empiece en la misma barra: como
+    las señales son invariantes a barras futuras, las de una serie más larga
+    coinciden con las de cualquier prefijo y aquí sólo se usan las de barras
+    presentes.
     """
 
     def __init__(self, parameters: BacktestParameters) -> None:
@@ -167,6 +174,7 @@ class BacktestEngine:
         trading_sessions: Sequence[date] | None = None,
         dividends_by_symbol: Mapping[str, Sequence[CorporateDividend]] | None = None,
         trading_start: date | None = None,
+        precomputed_signals: Mapping[str, Sequence[LongSignal]] | None = None,
     ) -> BacktestResult:
         parameters = self._parameters
         costs = parameters.costs
@@ -187,7 +195,12 @@ class BacktestEngine:
         signals_by_symbol = {
             symbol: {
                 index_by_symbol[symbol][signal.signal_timestamp]: signal
-                for signal in self._signal_generator.generate(bars)
+                for signal in (
+                    self._signal_generator.generate(bars)
+                    if precomputed_signals is None
+                    else precomputed_signals.get(symbol, ())
+                )
+                if signal.signal_timestamp in index_by_symbol[symbol]
             }
             for symbol, bars in series.items()
         }

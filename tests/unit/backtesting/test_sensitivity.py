@@ -4,6 +4,9 @@ import pytest
 
 from algo_trading.backtesting import BacktestParameters
 from algo_trading.backtesting.sensitivity import (
+    DEFAULT_MAX_POSITION_EXPOSURES as DEFAULT_EXPOSURES,
+)
+from algo_trading.backtesting.sensitivity import (
     EXTENDED_TAKE_PROFIT_ATR_MULTIPLES,
     ParameterCombination,
     ParameterGrid,
@@ -110,10 +113,10 @@ def test_markdown_table_has_one_row_per_combination() -> None:
     assert "- Perfil de costes: base (comisión 0.05 %, slippage 0.05 %)" in markdown
     assert "- Buy & Hold del periodo: 25.00 %" in markdown
     assert (
-        "| 1 | 2 | 10.00 % | 5.00 % | 4.00 % | 45.00 % | n/d | 0.10 | 10 | n/d |"
-        in (markdown)
+        "| 1 | 2 | 10.00 % | 5 | 0.50 % | 5.00 % | 4.00 % | 45.00 % | n/d | 0.10 "
+        "| 10 | n/d |" in (markdown)
     )
-    assert "| 2 | 2 | 10.00 % | 8.00 % | 6.00 % |" in markdown
+    assert "| 2 | 2 | 10.00 % | 5 | 0.50 % | 8.00 % | 6.00 % |" in markdown
     assert (
         "- Mayor retorno: SL 2 × ATR, TP 2 × ATR, exposición 10.00 % (8.00 %)."
         in markdown
@@ -160,3 +163,65 @@ def test_combination_applies_risk_parameters() -> None:
 def test_take_profit_multiples_must_be_positive() -> None:
     with pytest.raises(ValueError, match="take profit"):
         ParameterGrid(take_profit_atr_multiples=(Decimal("0"),))
+
+
+def test_portfolio_scale_axes_default_to_v1_values() -> None:
+    grid = ParameterGrid()
+
+    assert grid.max_positions == (5,)
+    assert grid.risk_per_trade == (Decimal("0.005"),)
+    assert grid.scale_levels() == ((5, Decimal("0.005")),)
+
+
+def test_portfolio_scaling_grid_combinations() -> None:
+    grid = ParameterGrid(
+        stop_loss_atr_multiples=(Decimal("1.5"), Decimal("2.0")),
+        take_profit_atr_multiples=(Decimal("2.5"), Decimal("3.0")),
+        max_position_exposures=DEFAULT_EXPOSURES,
+        max_positions=(5, 8, 10),
+        risk_per_trade=(Decimal("0.005"), Decimal("0.010"), Decimal("0.015")),
+    )
+
+    combinations = grid.combinations()
+
+    assert len(combinations) == 108
+    assert len(grid.scale_levels()) == 9
+    assert combinations[0].scale == (5, Decimal("0.005"))
+    assert combinations[1].scale == (5, Decimal("0.010"))
+    assert combinations[3].scale == (8, Decimal("0.005"))
+    assert combinations[-1] == ParameterCombination(
+        stop_loss_atr_multiple=Decimal("2.0"),
+        take_profit_atr_multiple=Decimal("3.0"),
+        max_position_exposure=Decimal("0.20"),
+        max_positions=10,
+        risk_per_trade=Decimal("0.015"),
+    )
+
+
+def test_combination_applies_portfolio_scale() -> None:
+    combination = ParameterCombination(
+        stop_loss_atr_multiple=Decimal("1.5"),
+        take_profit_atr_multiple=Decimal("3"),
+        max_position_exposure=Decimal("0.15"),
+        max_positions=8,
+        risk_per_trade=Decimal("0.01"),
+    )
+
+    risk = combination.apply(BacktestParameters(initial_cash=Decimal("1000"))).risk
+
+    assert risk.max_positions == 8
+    assert risk.risk_per_trade == Decimal("0.01")
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"max_positions": (0,)}, "posiciones"),
+        ({"risk_per_trade": (Decimal("0"),)}, "riesgo"),
+        ({"risk_per_trade": (Decimal("1.5"),)}, "riesgo"),
+        ({"max_positions": (5, 5)}, "duplicados"),
+    ],
+)
+def test_portfolio_scale_validation(kwargs: dict[str, object], message: str) -> None:
+    with pytest.raises(ValueError, match=message):
+        ParameterGrid(**kwargs)  # type: ignore[arg-type]

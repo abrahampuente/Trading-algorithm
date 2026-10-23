@@ -18,7 +18,11 @@ from algo_trading.analytics.walk_forward import (
     sharpe_ratio,
     walk_forward_to_markdown,
 )
-from algo_trading.backtesting import BacktestParameters, EquityPoint
+from algo_trading.backtesting import (
+    BacktestEngine,
+    BacktestParameters,
+    EquityPoint,
+)
 from algo_trading.backtesting.sensitivity import ParameterGrid
 from algo_trading.data.market_bar import MarketBar
 
@@ -407,3 +411,108 @@ def test_take_profit_axis_is_evaluated_and_selected() -> None:
         assert window.out_of_sample.take_profit_atr_multiple == (
             window.selected.take_profit_atr_multiple
         )
+
+
+SCALING_CONFIG = WalkForwardConfig(
+    in_sample_months=6,
+    out_of_sample_months=3,
+    min_trades=1,
+    grid=ParameterGrid(
+        stop_loss_atr_multiples=(Decimal("1.5"),),
+        take_profit_atr_multiples=(Decimal("2.5"), Decimal("3.0")),
+        max_position_exposures=(Decimal("0.10"),),
+        max_positions=(2, 5),
+        risk_per_trade=(Decimal("0.005"), Decimal("0.01")),
+    ),
+)
+
+
+@pytest.fixture(scope="module")
+def scaling_report() -> WalkForwardReport:
+    return WalkForwardAnalyzer(synthetic_bars()).run(PARAMETERS, SCALING_CONFIG)
+
+
+def test_scaling_study_has_one_walk_forward_per_level(
+    scaling_report: WalkForwardReport,
+) -> None:
+    levels = [
+        (level.max_positions, level.risk_per_trade)
+        for level in scaling_report.scaling_study
+    ]
+
+    assert levels == list(SCALING_CONFIG.grid.scale_levels())
+    for level in scaling_report.scaling_study:
+        assert len(level.selected) == len(scaling_report.windows)
+        assert all(
+            selected.combination.scale == (level.max_positions, level.risk_per_trade)
+            for selected in level.selected
+        )
+        assert level.theoretical_max_risk == level.max_positions * level.risk_per_trade
+
+
+def test_scaling_levels_reuse_the_main_in_sample_grid(
+    scaling_report: WalkForwardReport,
+) -> None:
+    for index, result in enumerate(scaling_report.windows):
+        assert len(result.in_sample) == 8
+        for level in scaling_report.scaling_study:
+            assert level.selected[index] in result.in_sample
+
+
+def test_scaling_level_matches_walk_forward_with_that_level_only(
+    scaling_report: WalkForwardReport,
+) -> None:
+    level = scaling_report.scaling_study[-1]
+    fixed = SCALING_CONFIG.model_copy(
+        update={
+            "grid": SCALING_CONFIG.grid.model_copy(
+                update={
+                    "max_positions": (level.max_positions,),
+                    "risk_per_trade": (level.risk_per_trade,),
+                }
+            )
+        }
+    )
+
+    direct = WalkForwardAnalyzer(synthetic_bars()).run(PARAMETERS, fixed)
+
+    assert direct.scaling_study == ()
+    assert direct.out_of_sample == level.out_of_sample
+    assert direct.walk_forward_efficiency == level.walk_forward_efficiency
+
+
+def test_scaling_section_in_markdown(scaling_report: WalkForwardReport) -> None:
+    markdown = walk_forward_to_markdown(scaling_report)
+
+    assert "## Escalado de cartera" in markdown
+    assert "| **optimizado** | por ventana |" in markdown
+    assert "Mayor retorno OOS:" in markdown
+    assert "Mayor Sharpe OOS:" in markdown
+
+
+def test_precomputed_signals_give_identical_results() -> None:
+    bars = synthetic_bars()
+    analyzer = WalkForwardAnalyzer(bars)
+    window_start = date(2022, 7, 1)
+    window_end = date(2022, 12, 31)
+    parameters = PARAMETERS.model_copy(update={"initial_cash": Decimal("50000")})
+    sliced = {
+        symbol: [bar for bar in series if bar.timestamp.date() <= window_end]
+        for symbol, series in bars.items()
+    }
+
+    cached = analyzer.evaluate(parameters, window_start, window_end)
+    fresh = BacktestEngine(parameters).run(sliced, trading_start=window_start)
+
+    assert cached[1] == fresh.trades
+    assert cached[2] == fresh.equity_curve
+
+
+def test_average_open_positions_matches_equity_curve(
+    report: WalkForwardReport,
+) -> None:
+    curve = report.out_of_sample_equity_curve
+    expected = Decimal(sum(point.open_positions for point in curve)) / len(curve)
+
+    assert report.out_of_sample.average_open_positions == expected
+    assert "| Posiciones abiertas medias |" in walk_forward_to_markdown(report)

@@ -52,6 +52,11 @@ from algo_trading.backtesting.sensitivity import (
 from algo_trading.domain.corporate_actions.dto import CorporateDividend
 from algo_trading.execution.trade import Trade
 from algo_trading.portfolio.position_sizing import MONEY_PRECISION, MONEY_ROUNDING
+from algo_trading.strategy.long_signal import (
+    LongSignal,
+    LongSignalGenerator,
+    SignalParameters,
+)
 
 TRADING_DAYS_PER_YEAR = 252
 DAYS_PER_YEAR = Decimal("365.25")
@@ -131,6 +136,8 @@ class PeriodEvaluation(BaseModel):
     stop_loss_atr_multiple: Decimal
     take_profit_atr_multiple: Decimal
     max_position_exposure: Decimal
+    max_positions: int = 5
+    risk_per_trade: Decimal = Decimal("0.005")
     initial_equity: Decimal
     final_equity: Decimal
     cumulative_return: Decimal
@@ -142,6 +149,7 @@ class PeriodEvaluation(BaseModel):
     total_trades: int = Field(ge=0)
     time_in_market: Decimal | None = None
     average_exposure: Decimal | None = None
+    average_open_positions: Decimal | None = None
 
     @property
     def combination(self) -> ParameterCombination:
@@ -149,6 +157,8 @@ class PeriodEvaluation(BaseModel):
             stop_loss_atr_multiple=self.stop_loss_atr_multiple,
             take_profit_atr_multiple=self.take_profit_atr_multiple,
             max_position_exposure=self.max_position_exposure,
+            max_positions=self.max_positions,
+            risk_per_trade=self.risk_per_trade,
         )
 
 
@@ -163,10 +173,34 @@ class WalkForwardWindowResult(BaseModel):
     buy_and_hold_return: Decimal | None = None
 
 
+class PortfolioScaleResult(BaseModel):
+    """
+    Walk-forward restringido a un nivel de escala de cartera.
+
+    En cada ventana IS sólo compiten las combinaciones con ese número máximo
+    de posiciones y ese riesgo por operación (SL, TP y exposición siguen
+    optimizándose); su OOS se encadena igual que el walk-forward principal.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    max_positions: int
+    risk_per_trade: Decimal
+    selected: tuple[PeriodEvaluation, ...]
+    out_of_sample: PeriodEvaluation
+    mean_in_sample_annualized_return: Decimal | None
+    walk_forward_efficiency: Decimal | None
+
+    @property
+    def theoretical_max_risk(self) -> Decimal:
+        """Riesgo planificado simultáneo máximo: posiciones x riesgo por operación."""
+        return self.max_positions * self.risk_per_trade
+
+
 class WalkForwardReport(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    report_version: str = "walk-forward-report-v2"
+    report_version: str = "walk-forward-report-v3"
     universe: str | None = None
     symbols: tuple[str, ...]
     trading_calendar: str | None
@@ -179,6 +213,7 @@ class WalkForwardReport(BaseModel):
     mean_in_sample_annualized_return: Decimal | None
     walk_forward_efficiency: Decimal | None
     buy_and_hold: BuyAndHoldComparison | None = None
+    scaling_study: tuple[PortfolioScaleResult, ...] = ()
 
     @property
     def is_robust(self) -> bool | None:
@@ -359,6 +394,25 @@ class WalkForwardAnalyzer:
         }
         self._sessions = tuple(trading_sessions) if trading_sessions else None
         self._calendar_name = trading_calendar
+        self._signals: dict[SignalParameters, dict[str, tuple[LongSignal, ...]]] = {}
+
+    def signals(
+        self,
+        parameters: SignalParameters,
+    ) -> dict[str, tuple[LongSignal, ...]]:
+        """
+        Señales de todo el historial, calculadas una vez por parámetros.
+
+        Son invariantes a barras futuras, así que valen para cualquier
+        ventana: el motor sólo usa las de barras hasta el fin de la ventana.
+        """
+        if parameters not in self._signals:
+            generator = LongSignalGenerator(parameters)
+            self._signals[parameters] = {
+                symbol: generator.generate(bars) for symbol, bars in self._bars.items()
+            }
+
+        return self._signals[parameters]
 
     @property
     def data_start(self) -> date:
@@ -395,6 +449,7 @@ class WalkForwardAnalyzer:
             trading_sessions=sessions,
             dividends_by_symbol=dividends,
             trading_start=start,
+            precomputed_signals=self.signals(parameters.signal),
         )
         initial_equity = parameters.initial_cash
 
@@ -410,6 +465,8 @@ class WalkForwardAnalyzer:
             stop_loss_atr_multiple=parameters.risk.stop_loss_atr_multiple,
             take_profit_atr_multiple=parameters.risk.take_profit_atr_multiple,
             max_position_exposure=parameters.risk.max_position_exposure,
+            max_positions=parameters.risk.max_positions,
+            risk_per_trade=parameters.risk.risk_per_trade,
             initial_equity=initial_equity,
             final_equity=result.final_cash,
             cumulative_return=cumulative_return,
@@ -424,6 +481,7 @@ class WalkForwardAnalyzer:
             total_trades=statistics.total_trades,
             time_in_market=exposure.time_in_market,
             average_exposure=exposure.average_exposure,
+            average_open_positions=_average_open_positions(curve),
         )
         return evaluation, result.trades, curve
 
@@ -475,13 +533,10 @@ class WalkForwardAnalyzer:
                 f"{config.in_sample_months} meses seguida de OOS"
             )
 
-        oos_equity = base_parameters.initial_cash
-        window_results: list[WalkForwardWindowResult] = []
-        oos_trades: list[Trade] = []
-        oos_curve: list[EquityPoint] = []
-
-        for window in windows:
-            in_sample = tuple(
+        # La rejilla IS se evalúa una sola vez por ventana; el walk-forward
+        # principal y el estudio de escalado sólo cambian la selección.
+        in_sample_by_window = {
+            window.index: tuple(
                 self.evaluate(
                     combination.apply(base_parameters),
                     window.in_sample_start,
@@ -489,29 +544,123 @@ class WalkForwardAnalyzer:
                 )[0]
                 for combination in config.grid.combinations()
             )
+            for window in windows
+        }
+
+        chain = self._chain_out_of_sample(
+            base_parameters,
+            config,
+            windows,
+            in_sample_by_window,
+            include_benchmark=True,
+        )
+        out_of_sample, mean_in_sample, efficiency = self._summarize(
+            base_parameters,
+            windows,
+            chain,
+            analysis_end,
+        )
+
+        scaling_study: list[PortfolioScaleResult] = []
+        scale_levels = config.grid.scale_levels()
+
+        if len(scale_levels) > 1:
+            for max_positions, risk_per_trade in scale_levels:
+                level_chain = self._chain_out_of_sample(
+                    base_parameters,
+                    config,
+                    windows,
+                    {
+                        index: tuple(
+                            evaluation
+                            for evaluation in evaluations
+                            if evaluation.combination.scale
+                            == (max_positions, risk_per_trade)
+                        )
+                        for index, evaluations in in_sample_by_window.items()
+                    },
+                    include_benchmark=False,
+                )
+                level_oos, level_mean_is, level_efficiency = self._summarize(
+                    base_parameters,
+                    windows,
+                    level_chain,
+                    analysis_end,
+                )
+                scaling_study.append(
+                    PortfolioScaleResult(
+                        max_positions=max_positions,
+                        risk_per_trade=risk_per_trade,
+                        selected=tuple(r.selected for r in level_chain.results),
+                        out_of_sample=level_oos,
+                        mean_in_sample_annualized_return=level_mean_is,
+                        walk_forward_efficiency=level_efficiency,
+                    )
+                )
+
+        return WalkForwardReport(
+            universe=universe,
+            symbols=tuple(sorted(self._bars)),
+            trading_calendar=self._calendar_name,
+            base_parameters=base_parameters,
+            config=config,
+            windows=chain.results,
+            out_of_sample=out_of_sample,
+            out_of_sample_trades=chain.trades,
+            out_of_sample_equity_curve=chain.curve,
+            mean_in_sample_annualized_return=mean_in_sample,
+            walk_forward_efficiency=efficiency,
+            buy_and_hold=self.buy_and_hold(
+                base_parameters,
+                windows[0].out_of_sample_start,
+                windows[-1].out_of_sample_end,
+                out_of_sample.cumulative_return,
+            ),
+            scaling_study=tuple(scaling_study),
+        )
+
+    def _chain_out_of_sample(
+        self,
+        base_parameters: BacktestParameters,
+        config: WalkForwardConfig,
+        windows: Sequence[WalkForwardWindow],
+        in_sample_by_window: Mapping[int, Sequence[PeriodEvaluation]],
+        include_benchmark: bool,
+    ) -> "_OutOfSampleChain":
+        """Selecciona en cada IS y encadena las OOS con capital compuesto."""
+        equity = base_parameters.initial_cash
+        results: list[WalkForwardWindowResult] = []
+        trades: list[Trade] = []
+        curve: list[EquityPoint] = []
+
+        for window in windows:
+            in_sample = tuple(in_sample_by_window[window.index])
             selected = select_best(
                 in_sample,
                 config.selection_metric,
                 config.min_trades,
             )
-            oos_parameters = selected.combination.apply(base_parameters).model_copy(
-                update={"initial_cash": oos_equity}
-            )
-            out_of_sample, trades, curve = self.evaluate(
-                oos_parameters,
+            out_of_sample, window_trades, window_curve = self.evaluate(
+                selected.combination.apply(base_parameters).model_copy(
+                    update={"initial_cash": equity}
+                ),
                 window.out_of_sample_start,
                 window.out_of_sample_end,
             )
-            window_benchmark = self.buy_and_hold(
-                base_parameters,
-                window.out_of_sample_start,
-                window.out_of_sample_end,
-                out_of_sample.cumulative_return,
+            benchmark = (
+                self.buy_and_hold(
+                    base_parameters,
+                    window.out_of_sample_start,
+                    window.out_of_sample_end,
+                    out_of_sample.cumulative_return,
+                )
+                if include_benchmark
+                else None
             )
-            oos_equity = out_of_sample.final_equity
-            oos_trades.extend(trades)
-            oos_curve.extend(curve)
-            window_results.append(
+            equity = out_of_sample.final_equity
+            trades.extend(window_trades)
+            curve.extend(window_curve)
+            results.append(
                 WalkForwardWindowResult(
                     window=window,
                     in_sample=in_sample,
@@ -522,20 +671,33 @@ class WalkForwardAnalyzer:
                         selected.annualized_return,
                     ),
                     buy_and_hold_return=(
-                        window_benchmark.cumulative_return
-                        if window_benchmark is not None
-                        else None
+                        benchmark.cumulative_return if benchmark is not None else None
                     ),
                 )
             )
 
+        return _OutOfSampleChain(
+            results=tuple(results),
+            trades=tuple(trades),
+            curve=tuple(curve),
+            final_equity=equity,
+        )
+
+    @staticmethod
+    def _summarize(
+        base_parameters: BacktestParameters,
+        windows: Sequence[WalkForwardWindow],
+        chain: "_OutOfSampleChain",
+        analysis_end: date,
+    ) -> tuple[PeriodEvaluation, Decimal | None, Decimal | None]:
+        """Métricas de la curva OOS encadenada, IS medio y WFE global."""
         initial_equity = base_parameters.initial_cash
 
         with localcontext(prec=MONEY_PRECISION, rounding=MONEY_ROUNDING):
-            cumulative = oos_equity / initial_equity - 1
+            cumulative = chain.final_equity / initial_equity - 1
             in_sample_returns = [
                 result.selected.annualized_return
-                for result in window_results
+                for result in chain.results
                 if result.selected.annualized_return is not None
             ]
             mean_in_sample = (
@@ -544,50 +706,49 @@ class WalkForwardAnalyzer:
                 else None
             )
 
-        statistics = calculate_trade_statistics(oos_trades)
+        statistics = calculate_trade_statistics(chain.trades)
         first_oos = windows[0].out_of_sample_start
-        last_oos = oos_curve[-1].timestamp.date() if oos_curve else analysis_end
+        last_oos = chain.curve[-1].timestamp.date() if chain.curve else analysis_end
         oos_annualized = annualized_return(cumulative, first_oos, last_oos)
-        last_selected = window_results[-1].selected
-        oos_exposure = calculate_curve_exposure(oos_curve)
+        last_selected = chain.results[-1].selected
+        exposure = calculate_curve_exposure(chain.curve)
 
-        return WalkForwardReport(
-            universe=universe,
-            symbols=tuple(sorted(self._bars)),
-            trading_calendar=self._calendar_name,
-            base_parameters=base_parameters,
-            config=config,
-            windows=tuple(window_results),
-            out_of_sample=PeriodEvaluation(
-                stop_loss_atr_multiple=last_selected.stop_loss_atr_multiple,
-                take_profit_atr_multiple=last_selected.take_profit_atr_multiple,
-                max_position_exposure=last_selected.max_position_exposure,
-                initial_equity=initial_equity,
-                final_equity=oos_equity,
-                cumulative_return=cumulative,
-                annualized_return=oos_annualized,
-                max_drawdown_pct=calculate_max_drawdown(
-                    [(point.timestamp, point.equity) for point in oos_curve],
-                    initial_equity,
-                ).max_drawdown_pct,
-                profit_factor=statistics.profit_factor,
-                sharpe_ratio=sharpe_ratio(oos_curve, initial_equity),
-                win_rate=statistics.win_rate,
-                total_trades=statistics.total_trades,
-                time_in_market=oos_exposure.time_in_market,
-                average_exposure=oos_exposure.average_exposure,
-            ),
-            out_of_sample_trades=tuple(oos_trades),
-            out_of_sample_equity_curve=tuple(oos_curve),
-            mean_in_sample_annualized_return=mean_in_sample,
-            walk_forward_efficiency=_efficiency(oos_annualized, mean_in_sample),
-            buy_and_hold=self.buy_and_hold(
-                base_parameters,
-                first_oos,
-                windows[-1].out_of_sample_end,
-                cumulative,
-            ),
+        out_of_sample = PeriodEvaluation(
+            stop_loss_atr_multiple=last_selected.stop_loss_atr_multiple,
+            take_profit_atr_multiple=last_selected.take_profit_atr_multiple,
+            max_position_exposure=last_selected.max_position_exposure,
+            max_positions=last_selected.max_positions,
+            risk_per_trade=last_selected.risk_per_trade,
+            initial_equity=initial_equity,
+            final_equity=chain.final_equity,
+            cumulative_return=cumulative,
+            annualized_return=oos_annualized,
+            max_drawdown_pct=calculate_max_drawdown(
+                [(point.timestamp, point.equity) for point in chain.curve],
+                initial_equity,
+            ).max_drawdown_pct,
+            profit_factor=statistics.profit_factor,
+            sharpe_ratio=sharpe_ratio(chain.curve, initial_equity),
+            win_rate=statistics.win_rate,
+            total_trades=statistics.total_trades,
+            time_in_market=exposure.time_in_market,
+            average_exposure=exposure.average_exposure,
+            average_open_positions=_average_open_positions(chain.curve),
         )
+        return (
+            out_of_sample,
+            mean_in_sample,
+            _efficiency(oos_annualized, mean_in_sample),
+        )
+
+
+class _OutOfSampleChain(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    results: tuple[WalkForwardWindowResult, ...]
+    trades: tuple[Trade, ...]
+    curve: tuple[EquityPoint, ...]
+    final_equity: Decimal
 
 
 def walk_forward_to_markdown(report: WalkForwardReport) -> str:
@@ -624,6 +785,10 @@ def walk_forward_to_markdown(report: WalkForwardReport) -> str:
         + ", ".join(str(value) for value in config.grid.take_profit_atr_multiples)
         + "; exposición "
         + ", ".join(_pct(value) for value in config.grid.max_position_exposures)
+        + "; posiciones "
+        + ", ".join(str(value) for value in config.grid.max_positions)
+        + "; riesgo "
+        + ", ".join(_pct(value) for value in config.grid.risk_per_trade)
         + f" ({len(config.grid.combinations())} combinaciones)",
         f"- Perfil de costes: {parameters.cost_profile or NOT_AVAILABLE}; anti-gap "
         f"{parameters.gap_threshold_atr} × ATR",
@@ -669,14 +834,16 @@ def walk_forward_to_markdown(report: WalkForwardReport) -> str:
         f"| Exposición media (valor de mercado / equity) | "
         f"{_pct(oos.average_exposure)} |",
         f"| Capital ocioso medio | {_pct(idle_capital)} |",
+        f"| Posiciones abiertas medias | {_ratio(oos.average_open_positions)} |",
         "",
         "## Ventanas",
         "",
-        "| # | IS | OOS | SL × ATR | TP × ATR | Exposición | PF IS | Sharpe IS "
-        "| Anual. IS | Anual. OOS | Retorno OOS | B&H OOS | MDD OOS | PF OOS "
-        "| Tiempo en mercado | Exposición media | Trades OOS | WFE |",
+        "| # | IS | OOS | SL × ATR | TP × ATR | Exposición | Posiciones | Riesgo "
+        "| PF IS | Sharpe IS | Anual. IS | Anual. OOS | Retorno OOS | B&H OOS "
+        "| MDD OOS | PF OOS | Tiempo en mercado | Exposición media | Trades OOS "
+        "| WFE |",
         "| ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: "
-        "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
 
     for result in report.windows:
@@ -690,6 +857,7 @@ def walk_forward_to_markdown(report: WalkForwardReport) -> str:
             f"| {selected.stop_loss_atr_multiple} "
             f"| {selected.take_profit_atr_multiple} "
             f"| {_pct(selected.max_position_exposure)} "
+            f"| {selected.max_positions} | {_pct(selected.risk_per_trade)} "
             f"| {_ratio(selected.profit_factor)} | {_ratio(selected.sharpe_ratio)} "
             f"| {_pct(selected.annualized_return)} | {_pct(out.annualized_return)} "
             f"| {_pct(out.cumulative_return)} | {_pct(result.buy_and_hold_return)} "
@@ -698,6 +866,9 @@ def walk_forward_to_markdown(report: WalkForwardReport) -> str:
             f"| {_pct(out.average_exposure)} | {out.total_trades} "
             f"| {_pct(result.walk_forward_efficiency)} |"
         )
+
+    if report.scaling_study:
+        lines.extend(_scaling_section(report))
 
     lines.extend(["", "## Rejilla In-Sample por ventana", ""])
 
@@ -708,15 +879,16 @@ def walk_forward_to_markdown(report: WalkForwardReport) -> str:
                 f"### Ventana {window.index}: IS {window.in_sample_start} → "
                 f"{window.in_sample_end}",
                 "",
-                "| SL × ATR | TP × ATR | Exposición | Retorno | Anualizado | MDD "
-                "| PF | Sharpe | Win Rate | Trades | Elegida |",
+                "| SL × ATR | TP × ATR | Exposición | Posiciones | Riesgo | Retorno "
+                "| Anualizado | MDD | PF | Sharpe | Win Rate | Trades | Elegida |",
                 "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: "
-                "| ---: | :---: |",
+                "| ---: | ---: | ---: | :---: |",
             ]
         )
         lines.extend(
             f"| {e.stop_loss_atr_multiple} | {e.take_profit_atr_multiple} "
-            f"| {_pct(e.max_position_exposure)} "
+            f"| {_pct(e.max_position_exposure)} | {e.max_positions} "
+            f"| {_pct(e.risk_per_trade)} "
             f"| {_pct(e.cumulative_return)} | {_pct(e.annualized_return)} "
             f"| {_pct(e.max_drawdown_pct)} | {_ratio(e.profit_factor)} "
             f"| {_ratio(e.sharpe_ratio)} | {_pct(e.win_rate)} | {e.total_trades} "
@@ -761,6 +933,77 @@ def write_walk_forward_report(
     json_path.write_text(report.model_dump_json(indent=2), encoding="utf-8")
     markdown_path.write_text(walk_forward_to_markdown(report), encoding="utf-8")
     return json_path, markdown_path
+
+
+def _scaling_section(report: WalkForwardReport) -> list[str]:
+    """Impacto OOS de cada nivel de escala frente al walk-forward optimizado."""
+    header = [
+        "",
+        "## Escalado de cartera",
+        "",
+        "Cada fila es un walk-forward completo restringido a un nivel de "
+        "posiciones y riesgo (SL, TP y exposición se siguen optimizando en "
+        "cada IS). La última fila deja que la selección IS elija también el "
+        "nivel. Riesgo teórico máximo = posiciones × riesgo por operación (la "
+        "especificación v1 lo limita a 2,5 %).",
+        "",
+        "| Posiciones | Riesgo | Riesgo teórico máx. | Retorno OOS | Anual. OOS "
+        "| MDD OOS | Sharpe | PF | Tiempo en mercado | Exposición media "
+        "| Posiciones medias | Trades | WFE |",
+        "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: "
+        "| ---: | ---: | ---: |",
+    ]
+
+    def row(label: str, risk: str, max_risk: str, oos: PeriodEvaluation) -> str:
+        return (
+            f"| {label} | {risk} | {max_risk} | {_pct(oos.cumulative_return)} "
+            f"| {_pct(oos.annualized_return)} | {_pct(oos.max_drawdown_pct)} "
+            f"| {_ratio(oos.sharpe_ratio)} | {_ratio(oos.profit_factor)} "
+            f"| {_pct(oos.time_in_market)} | {_pct(oos.average_exposure)} "
+            f"| {_ratio(oos.average_open_positions)} | {oos.total_trades} |"
+        )
+
+    rows = [
+        row(
+            str(level.max_positions),
+            _pct(level.risk_per_trade),
+            _pct(level.theoretical_max_risk),
+            level.out_of_sample,
+        )
+        + f" {_pct(level.walk_forward_efficiency)} |"
+        for level in report.scaling_study
+    ]
+    rows.append(
+        row("**optimizado**", "por ventana", "-", report.out_of_sample)
+        + f" {_pct(report.walk_forward_efficiency)} |"
+    )
+    best_return = max(
+        report.scaling_study,
+        key=lambda level: level.out_of_sample.cumulative_return,
+    )
+    best_sharpe = max(
+        report.scaling_study,
+        key=lambda level: level.out_of_sample.sharpe_ratio or Decimal("-Infinity"),
+    )
+    return [
+        *header,
+        *rows,
+        "",
+        f"- Mayor retorno OOS: {best_return.max_positions} posiciones, "
+        f"riesgo {_pct(best_return.risk_per_trade)} "
+        f"({_pct(best_return.out_of_sample.cumulative_return)}, MDD "
+        f"{_pct(best_return.out_of_sample.max_drawdown_pct)}).",
+        f"- Mayor Sharpe OOS: {best_sharpe.max_positions} posiciones, "
+        f"riesgo {_pct(best_sharpe.risk_per_trade)} "
+        f"(Sharpe {_ratio(best_sharpe.out_of_sample.sharpe_ratio)}).",
+    ]
+
+
+def _average_open_positions(curve: Sequence[EquityPoint]) -> Decimal | None:
+    if not curve:
+        return None
+
+    return Decimal(sum(point.open_positions for point in curve)) / len(curve)
 
 
 def _efficiency(

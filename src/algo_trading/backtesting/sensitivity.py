@@ -17,17 +17,31 @@ DEFAULT_STOP_LOSS_ATR_MULTIPLES = (Decimal("1.0"), Decimal("1.5"), Decimal("2.0"
 DEFAULT_MAX_POSITION_EXPOSURES = (Decimal("0.10"), Decimal("0.15"), Decimal("0.20"))
 DEFAULT_TAKE_PROFIT_ATR_MULTIPLES = (Decimal("2.0"),)
 EXTENDED_TAKE_PROFIT_ATR_MULTIPLES = (Decimal("2.0"), Decimal("2.5"), Decimal("3.0"))
+DEFAULT_MAX_POSITIONS = (5,)
+DEFAULT_RISK_PER_TRADE = (Decimal("0.005"),)
 NOT_AVAILABLE = "n/d"
 
 
 class ParameterCombination(BaseModel):
-    """Una combinación de la rejilla: multiplicadores de SL y TP, y exposición."""
+    """
+    Una combinación de la rejilla.
+
+    Niveles de salida (SL y TP en ATR), exposición máxima por posición y
+    escala de cartera (posiciones simultáneas y riesgo por operación).
+    """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     stop_loss_atr_multiple: Decimal = Field(gt=0)
     take_profit_atr_multiple: Decimal = Field(gt=0)
     max_position_exposure: Decimal = Field(gt=0, le=1)
+    max_positions: int = Field(default=5, ge=1)
+    risk_per_trade: Decimal = Field(default=Decimal("0.005"), gt=0, le=1)
+
+    @property
+    def scale(self) -> tuple[int, Decimal]:
+        """Nivel de escala de cartera: (posiciones, riesgo por operación)."""
+        return self.max_positions, self.risk_per_trade
 
     def apply(self, parameters: BacktestParameters) -> BacktestParameters:
         """Copia de los parámetros con esta combinación de riesgo."""
@@ -38,6 +52,8 @@ class ParameterCombination(BaseModel):
                         "stop_loss_atr_multiple": self.stop_loss_atr_multiple,
                         "take_profit_atr_multiple": self.take_profit_atr_multiple,
                         "max_position_exposure": self.max_position_exposure,
+                        "max_positions": self.max_positions,
+                        "risk_per_trade": self.risk_per_trade,
                     }
                 )
             }
@@ -46,10 +62,12 @@ class ParameterCombination(BaseModel):
 
 class ParameterGrid(BaseModel):
     """
-    Rejilla de parámetros a evaluar: producto cartesiano de los tres ejes.
+    Rejilla de parámetros a evaluar: producto cartesiano de todos los ejes.
 
-    Por defecto el TP se mantiene en 2 × ATR (rejilla 3 × 3 de SL y
-    exposición); `EXTENDED_TAKE_PROFIT_ATR_MULTIPLES` amplía a 3 × 3 × 3.
+    Por defecto el TP se mantiene en 2 × ATR y la cartera en 5 posiciones con
+    0,5 % de riesgo (rejilla 3 × 3 de SL y exposición);
+    `EXTENDED_TAKE_PROFIT_ATR_MULTIPLES` amplía el TP y `max_positions` /
+    `risk_per_trade` permiten estudiar la escala de la cartera.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -66,6 +84,14 @@ class ParameterGrid(BaseModel):
         default=DEFAULT_MAX_POSITION_EXPOSURES,
         min_length=1,
     )
+    max_positions: tuple[int, ...] = Field(
+        default=DEFAULT_MAX_POSITIONS,
+        min_length=1,
+    )
+    risk_per_trade: tuple[Decimal, ...] = Field(
+        default=DEFAULT_RISK_PER_TRADE,
+        min_length=1,
+    )
 
     @model_validator(mode="after")
     def validate_grid(self) -> Self:
@@ -80,10 +106,18 @@ class ParameterGrid(BaseModel):
         if any(not 0 < exposure <= 1 for exposure in self.max_position_exposures):
             raise ValueError("Las exposiciones deben estar en (0, 1]")
 
+        if any(positions < 1 for positions in self.max_positions):
+            raise ValueError("El máximo de posiciones debe ser al menos 1")
+
+        if any(not 0 < risk <= 1 for risk in self.risk_per_trade):
+            raise ValueError("El riesgo por operación debe estar en (0, 1]")
+
         for name, values in (
             ("stop_loss_atr_multiples", self.stop_loss_atr_multiples),
             ("take_profit_atr_multiples", self.take_profit_atr_multiples),
             ("max_position_exposures", self.max_position_exposures),
+            ("max_positions", self.max_positions),
+            ("risk_per_trade", self.risk_per_trade),
         ):
             if len(set(values)) != len(values):
                 raise ValueError(f"{name} no puede contener duplicados")
@@ -91,19 +125,27 @@ class ParameterGrid(BaseModel):
         return self
 
     def combinations(self) -> tuple[ParameterCombination, ...]:
-        """Combinaciones en orden de rejilla: SL, después TP, después exposición."""
+        """Combinaciones en orden de rejilla: SL, TP, exposición, posiciones, riesgo."""
         return tuple(
             ParameterCombination(
                 stop_loss_atr_multiple=stop_loss,
                 take_profit_atr_multiple=take_profit,
                 max_position_exposure=exposure,
+                max_positions=positions,
+                risk_per_trade=risk,
             )
-            for stop_loss, take_profit, exposure in product(
+            for stop_loss, take_profit, exposure, positions, risk in product(
                 self.stop_loss_atr_multiples,
                 self.take_profit_atr_multiples,
                 self.max_position_exposures,
+                self.max_positions,
+                self.risk_per_trade,
             )
         )
+
+    def scale_levels(self) -> tuple[tuple[int, Decimal], ...]:
+        """Niveles de escala (posiciones, riesgo) en el orden de la rejilla."""
+        return tuple(product(self.max_positions, self.risk_per_trade))
 
 
 class SensitivityRow(BaseModel):
@@ -112,6 +154,8 @@ class SensitivityRow(BaseModel):
     stop_loss_atr_multiple: Decimal
     take_profit_atr_multiple: Decimal
     max_position_exposure: Decimal
+    max_positions: int = 5
+    risk_per_trade: Decimal = Decimal("0.005")
     run_id: str | None
     cumulative_return: Decimal
     max_drawdown_pct: Decimal
@@ -195,6 +239,8 @@ class SensitivityAnalysisService:
                     stop_loss_atr_multiple=combination.stop_loss_atr_multiple,
                     take_profit_atr_multiple=combination.take_profit_atr_multiple,
                     max_position_exposure=combination.max_position_exposure,
+                    max_positions=combination.max_positions,
+                    risk_per_trade=combination.risk_per_trade,
                     run_id=outcome.run_id,
                     cumulative_return=metrics.cumulative_return,
                     max_drawdown_pct=metrics.max_drawdown.max_drawdown_pct,
@@ -226,13 +272,15 @@ class SensitivityAnalysisService:
 def sensitivity_table(rows: Sequence[SensitivityRow]) -> list[str]:
     """Tabla Markdown (legible también en consola) con una fila por combinación."""
     lines = [
-        "| SL × ATR | TP × ATR | Exposición | Retorno | MDD | Win Rate "
-        "| Profit Factor | Expectancy R | Trades | run_id |",
-        "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
+        "| SL × ATR | TP × ATR | Exposición | Posiciones | Riesgo | Retorno | MDD "
+        "| Win Rate | Profit Factor | Expectancy R | Trades | run_id |",
+        "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: "
+        "| ---: | --- |",
     ]
     lines.extend(
         f"| {row.stop_loss_atr_multiple} | {row.take_profit_atr_multiple} "
-        f"| {_pct(row.max_position_exposure)} "
+        f"| {_pct(row.max_position_exposure)} | {row.max_positions} "
+        f"| {_pct(row.risk_per_trade)} "
         f"| {_pct(row.cumulative_return)} | {_pct(row.max_drawdown_pct)} "
         f"| {_pct(row.win_rate)} | {_ratio(row.profit_factor)} "
         f"| {_ratio(row.expectancy_r)} | {row.total_trades} "
@@ -257,9 +305,7 @@ def sensitivity_to_markdown(report: SensitivityReport) -> str:
         f"- Perfil de costes: {parameters.cost_profile or NOT_AVAILABLE} "
         f"(comisión {_pct(parameters.costs.commission_rate)}, "
         f"slippage {_pct(parameters.costs.slippage_rate)})",
-        f"- Fijos: riesgo {_pct(parameters.risk.risk_per_trade)} por operación, "
-        f"{parameters.risk.max_positions} posiciones, "
-        f"anti-gap {parameters.gap_threshold_atr} × ATR",
+        f"- Fijos: anti-gap {parameters.gap_threshold_atr} × ATR",
         f"- Buy & Hold del periodo: {_pct(report.buy_and_hold_return)}",
         "",
         *sensitivity_table(report.rows),

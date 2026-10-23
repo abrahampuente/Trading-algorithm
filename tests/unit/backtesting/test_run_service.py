@@ -576,7 +576,10 @@ def test_cli_sweep_runs_grid_and_persists_runs_with_shared_sweep_id(
     assert json_path.name == "sensitivity_AAA_2024-01-01_2024-01-23_base.json"
     markdown = markdown_path.read_text(encoding="utf-8")
     assert markdown.startswith("# Análisis de sensibilidad")
-    assert "| SL × ATR | TP × ATR | Exposición | Retorno | MDD | Win Rate" in (markdown)
+    assert (
+        "| SL × ATR | TP × ATR | Exposición | Posiciones | Riesgo | Retorno | MDD"
+        in markdown
+    )
     assert "Barrido: " in format_sweep_summary(report, json_path, markdown_path)
 
     with Session(engine) as session:
@@ -640,7 +643,9 @@ def test_sweep_includes_take_profit_axis(engine: Engine, tmp_path: Path) -> None
     ]
     # El escenario cierra en TP con 2 x ATR; con 3 x ATR no se alcanza (fin de datos).
     assert report.rows[0].cumulative_return != report.rows[1].cumulative_return
-    assert "| 1 | 3 | 10.00 % |" in markdown_path.read_text(encoding="utf-8")
+    assert "| 1 | 3 | 10.00 % | 5 | 0.50 % |" in markdown_path.read_text(
+        encoding="utf-8"
+    )
 
 
 def test_cli_applies_take_profit_multiple(engine: Engine, tmp_path: Path) -> None:

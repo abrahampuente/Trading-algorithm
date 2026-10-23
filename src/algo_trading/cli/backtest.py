@@ -10,6 +10,8 @@ Uso:
     algo-backtest --sweep --sl-multiples 1 2 --exposures 0.10 0.20
     algo-backtest --walk-forward --is-months 36 --oos-months 12
     algo-backtest --walk-forward --universe diversified --tp-multiples 2 2.5 3
+    algo-backtest --walk-forward --universe diversified --positions-grid 5 8 10 \
+        --risk-grid 0.005 0.01 0.015 --report-tag portfolio_scaling
     algo-backtest --list-runs 10
 
 Lee `market_bars_adjusted` y los dividendos, valida las series contra el
@@ -128,6 +130,19 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Multiplicador de ATR para el take profit (v1: 2).",
     )
     parser.add_argument(
+        "--max-positions",
+        type=int,
+        default=None,
+        help="Posiciones simultáneas máximas (por defecto: max_positions de la "
+        "configuración).",
+    )
+    parser.add_argument(
+        "--risk-per-trade",
+        type=Decimal,
+        default=Decimal("0.005"),
+        help="Riesgo por operación sobre el equity (v1: 0.005).",
+    )
+    parser.add_argument(
         "--max-position-exposure",
         type=Decimal,
         default=Decimal("0.10"),
@@ -175,6 +190,25 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=Decimal,
         default=list(DEFAULT_MAX_POSITION_EXPOSURES),
         help="Exposiciones máximas del barrido (por defecto: 0.10 0.15 0.20).",
+    )
+    parser.add_argument(
+        "--positions-grid",
+        nargs="+",
+        type=int,
+        default=None,
+        help="Posiciones simultáneas de la rejilla (por defecto: --max-positions).",
+    )
+    parser.add_argument(
+        "--risk-grid",
+        nargs="+",
+        type=Decimal,
+        default=None,
+        help="Riesgos por operación de la rejilla (por defecto: --risk-per-trade).",
+    )
+    parser.add_argument(
+        "--report-tag",
+        default=None,
+        help="Etiqueta tras el prefijo del informe (p. ej. portfolio_scaling).",
     )
     parser.add_argument(
         "--walk-forward",
@@ -255,7 +289,8 @@ def build_request(
         initial_cash=arguments.initial_cash or settings.initial_capital,
         cost_profile=profile_name,
         risk=RiskParameters(
-            max_positions=settings.max_positions,
+            max_positions=arguments.max_positions or settings.max_positions,
+            risk_per_trade=arguments.risk_per_trade,
             max_position_exposure=arguments.max_position_exposure,
             stop_loss_atr_multiple=arguments.stop_loss_atr,
             take_profit_atr_multiple=arguments.take_profit_atr,
@@ -286,12 +321,30 @@ def resolve_symbols(
     return settings.universe(arguments.universe or DEFAULT_UNIVERSE)
 
 
+def build_grid(
+    arguments: argparse.Namespace,
+    request: BacktestRunRequest,
+) -> ParameterGrid:
+    """Rejilla de la CLI; sin `--positions-grid`/`--risk-grid` usa los valores base."""
+    risk = request.parameters.risk
+    return ParameterGrid(
+        stop_loss_atr_multiples=tuple(arguments.sl_multiples),
+        take_profit_atr_multiples=tuple(arguments.tp_multiples),
+        max_position_exposures=tuple(arguments.exposures),
+        max_positions=tuple(arguments.positions_grid or (risk.max_positions,)),
+        risk_per_trade=tuple(arguments.risk_grid or (risk.risk_per_trade,)),
+    )
+
+
 def report_label(
     prefix: str,
     arguments: argparse.Namespace,
     request: BacktestRunRequest,
 ) -> str:
-    """`<prefijo>_<universo o símbolos>_<inicio>_<fin>`."""
+    """`<prefijo>[_<etiqueta>]_<universo o símbolos>_<inicio>_<fin>`."""
+    if arguments.report_tag:
+        prefix = f"{prefix}_{arguments.report_tag}"
+
     if arguments.universe:
         return (
             f"{prefix}_{arguments.universe.lower()}_"
@@ -329,11 +382,7 @@ def run_sweep_command(
     calendar: TradingCalendar | None,
 ) -> tuple[SensitivityReport, Path, Path]:
     request = build_request(arguments, settings)
-    grid = ParameterGrid(
-        stop_loss_atr_multiples=tuple(arguments.sl_multiples),
-        take_profit_atr_multiples=tuple(arguments.tp_multiples),
-        max_position_exposures=tuple(arguments.exposures),
-    )
+    grid = build_grid(arguments, request)
 
     with session_factory() as session:
         report = SensitivityAnalysisService(
@@ -366,11 +415,7 @@ def run_walk_forward_command(
         step_months=arguments.wf_step_months,
         selection_metric=SelectionMetric(arguments.wf_metric),
         min_trades=arguments.min_trades,
-        grid=ParameterGrid(
-            stop_loss_atr_multiples=tuple(arguments.sl_multiples),
-            take_profit_atr_multiples=tuple(arguments.tp_multiples),
-            max_position_exposures=tuple(arguments.exposures),
-        ),
+        grid=build_grid(arguments, request),
     )
 
     with session_factory() as session:
@@ -476,7 +521,8 @@ def format_walk_forward_summary(
         f"Símbolos: {', '.join(report.symbols)}  "
         f"Costes: {report.base_parameters.cost_profile}",
         "",
-        f"{'#':>2} {'OOS':<25} {'SL':>4} {'TP':>4} {'exp.':>7} {'anual. IS':>10} "
+        f"{'#':>2} {'OOS':<25} {'SL':>4} {'TP':>4} {'exp.':>7} {'pos.':>4} "
+        f"{'riesgo':>7} {'anual. IS':>10} "
         f"{'anual. OOS':>10} {'PF OOS':>6} {'trades':>6} {'WFE':>9}",
     ]
 
@@ -488,6 +534,8 @@ def format_walk_forward_summary(
             f"{result.selected.stop_loss_atr_multiple!s:>4} "
             f"{result.selected.take_profit_atr_multiple!s:>4} "
             f"{_pct(result.selected.max_position_exposure):>7} "
+            f"{result.selected.max_positions:>4} "
+            f"{_pct(result.selected.risk_per_trade):>7} "
             f"{_pct(result.selected.annualized_return):>10} "
             f"{_pct(result.out_of_sample.annualized_return):>10} "
             f"{_ratio(result.out_of_sample.profit_factor):>6} "
@@ -513,11 +561,36 @@ def format_walk_forward_summary(
             f"exposición media {_pct(oos.average_exposure)}",
             f"Buy & Hold OOS: {_pct(benchmark_return)}  "
             f"Exceso de la estrategia: {_pct(excess_return)}",
+            *_scaling_lines(report),
             f"Informe JSON: {json_path}",
             f"Informe Markdown: {markdown_path}",
         ]
     )
     return "\n".join(lines)
+
+
+def _scaling_lines(report: WalkForwardReport) -> list[str]:
+    if not report.scaling_study:
+        return []
+
+    lines = [
+        "",
+        "Escalado de cartera (walk-forward por nivel):",
+        f"{'pos.':>4} {'riesgo':>7} {'retorno':>9} {'MDD':>8} {'Sharpe':>6} "
+        f"{'t. mercado':>10} {'exp. media':>10} {'WFE':>9}",
+    ]
+    lines.extend(
+        f"{level.max_positions:>4} {_pct(level.risk_per_trade):>7} "
+        f"{_pct(level.out_of_sample.cumulative_return):>9} "
+        f"{_pct(level.out_of_sample.max_drawdown_pct):>8} "
+        f"{_ratio(level.out_of_sample.sharpe_ratio):>6} "
+        f"{_pct(level.out_of_sample.time_in_market):>10} "
+        f"{_pct(level.out_of_sample.average_exposure):>10} "
+        f"{_pct(level.walk_forward_efficiency):>9}"
+        for level in report.scaling_study
+    )
+    lines.append("")
+    return lines
 
 
 def format_runs(runs: Sequence[BacktestRunSummary]) -> str:
