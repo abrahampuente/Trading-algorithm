@@ -15,16 +15,51 @@ from algo_trading.backtesting.run_service import (
 
 DEFAULT_STOP_LOSS_ATR_MULTIPLES = (Decimal("1.0"), Decimal("1.5"), Decimal("2.0"))
 DEFAULT_MAX_POSITION_EXPOSURES = (Decimal("0.10"), Decimal("0.15"), Decimal("0.20"))
+DEFAULT_TAKE_PROFIT_ATR_MULTIPLES = (Decimal("2.0"),)
+EXTENDED_TAKE_PROFIT_ATR_MULTIPLES = (Decimal("2.0"), Decimal("2.5"), Decimal("3.0"))
 NOT_AVAILABLE = "n/d"
 
 
+class ParameterCombination(BaseModel):
+    """Una combinación de la rejilla: multiplicadores de SL y TP, y exposición."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    stop_loss_atr_multiple: Decimal = Field(gt=0)
+    take_profit_atr_multiple: Decimal = Field(gt=0)
+    max_position_exposure: Decimal = Field(gt=0, le=1)
+
+    def apply(self, parameters: BacktestParameters) -> BacktestParameters:
+        """Copia de los parámetros con esta combinación de riesgo."""
+        return parameters.model_copy(
+            update={
+                "risk": parameters.risk.model_copy(
+                    update={
+                        "stop_loss_atr_multiple": self.stop_loss_atr_multiple,
+                        "take_profit_atr_multiple": self.take_profit_atr_multiple,
+                        "max_position_exposure": self.max_position_exposure,
+                    }
+                )
+            }
+        )
+
+
 class ParameterGrid(BaseModel):
-    """Rejilla de parámetros a evaluar: producto cartesiano de ambos ejes."""
+    """
+    Rejilla de parámetros a evaluar: producto cartesiano de los tres ejes.
+
+    Por defecto el TP se mantiene en 2 × ATR (rejilla 3 × 3 de SL y
+    exposición); `EXTENDED_TAKE_PROFIT_ATR_MULTIPLES` amplía a 3 × 3 × 3.
+    """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     stop_loss_atr_multiples: tuple[Decimal, ...] = Field(
         default=DEFAULT_STOP_LOSS_ATR_MULTIPLES,
+        min_length=1,
+    )
+    take_profit_atr_multiples: tuple[Decimal, ...] = Field(
+        default=DEFAULT_TAKE_PROFIT_ATR_MULTIPLES,
         min_length=1,
     )
     max_position_exposures: tuple[Decimal, ...] = Field(
@@ -37,11 +72,17 @@ class ParameterGrid(BaseModel):
         if any(multiple <= 0 for multiple in self.stop_loss_atr_multiples):
             raise ValueError("Los multiplicadores de stop loss deben ser mayores que 0")
 
+        if any(multiple <= 0 for multiple in self.take_profit_atr_multiples):
+            raise ValueError(
+                "Los multiplicadores de take profit deben ser mayores que 0"
+            )
+
         if any(not 0 < exposure <= 1 for exposure in self.max_position_exposures):
             raise ValueError("Las exposiciones deben estar en (0, 1]")
 
         for name, values in (
             ("stop_loss_atr_multiples", self.stop_loss_atr_multiples),
+            ("take_profit_atr_multiples", self.take_profit_atr_multiples),
             ("max_position_exposures", self.max_position_exposures),
         ):
             if len(set(values)) != len(values):
@@ -49,15 +90,27 @@ class ParameterGrid(BaseModel):
 
         return self
 
-    def combinations(self) -> tuple[tuple[Decimal, Decimal], ...]:
-        """Pares (multiplicador SL, exposición) en el orden de la rejilla."""
-        return tuple(product(self.stop_loss_atr_multiples, self.max_position_exposures))
+    def combinations(self) -> tuple[ParameterCombination, ...]:
+        """Combinaciones en orden de rejilla: SL, después TP, después exposición."""
+        return tuple(
+            ParameterCombination(
+                stop_loss_atr_multiple=stop_loss,
+                take_profit_atr_multiple=take_profit,
+                max_position_exposure=exposure,
+            )
+            for stop_loss, take_profit, exposure in product(
+                self.stop_loss_atr_multiples,
+                self.take_profit_atr_multiples,
+                self.max_position_exposures,
+            )
+        )
 
 
 class SensitivityRow(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     stop_loss_atr_multiple: Decimal
+    take_profit_atr_multiple: Decimal
     max_position_exposure: Decimal
     run_id: str | None
     cumulative_return: Decimal
@@ -97,7 +150,7 @@ class SensitivityAnalysisService:
     Barrido de parámetros sobre los datos de MySQL.
 
     Lee barras, dividendos y sesiones una sola vez y ejecuta un backtest por
-    combinación de la rejilla, variando sólo `risk.stop_loss_atr_multiple` y
+    combinación de la rejilla, variando sólo los multiplicadores de SL y TP y
     `risk.max_position_exposure` sobre los parámetros base. Con `persist`,
     cada ejecución se guarda en `backtest_runs` con el mismo `sweep_id`.
     """
@@ -122,17 +175,8 @@ class SensitivityAnalysisService:
         buy_and_hold_return: Decimal | None = None
         first_report = None
 
-        for stop_loss_multiple, exposure in grid.combinations():
-            parameters = request.parameters.model_copy(
-                update={
-                    "risk": request.parameters.risk.model_copy(
-                        update={
-                            "stop_loss_atr_multiple": stop_loss_multiple,
-                            "max_position_exposure": exposure,
-                        }
-                    )
-                }
-            )
+        for combination in grid.combinations():
+            parameters = combination.apply(request.parameters)
             outcome = self._run_service.run_prepared(
                 request.model_copy(update={"parameters": parameters}),
                 data,
@@ -148,8 +192,9 @@ class SensitivityAnalysisService:
 
             rows.append(
                 SensitivityRow(
-                    stop_loss_atr_multiple=stop_loss_multiple,
-                    max_position_exposure=exposure,
+                    stop_loss_atr_multiple=combination.stop_loss_atr_multiple,
+                    take_profit_atr_multiple=combination.take_profit_atr_multiple,
+                    max_position_exposure=combination.max_position_exposure,
                     run_id=outcome.run_id,
                     cumulative_return=metrics.cumulative_return,
                     max_drawdown_pct=metrics.max_drawdown.max_drawdown_pct,
@@ -181,12 +226,13 @@ class SensitivityAnalysisService:
 def sensitivity_table(rows: Sequence[SensitivityRow]) -> list[str]:
     """Tabla Markdown (legible también en consola) con una fila por combinación."""
     lines = [
-        "| SL × ATR | Exposición | Retorno | MDD | Win Rate | Profit Factor "
-        "| Expectancy R | Trades | run_id |",
-        "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
+        "| SL × ATR | TP × ATR | Exposición | Retorno | MDD | Win Rate "
+        "| Profit Factor | Expectancy R | Trades | run_id |",
+        "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
     ]
     lines.extend(
-        f"| {row.stop_loss_atr_multiple} | {_pct(row.max_position_exposure)} "
+        f"| {row.stop_loss_atr_multiple} | {row.take_profit_atr_multiple} "
+        f"| {_pct(row.max_position_exposure)} "
         f"| {_pct(row.cumulative_return)} | {_pct(row.max_drawdown_pct)} "
         f"| {_pct(row.win_rate)} | {_ratio(row.profit_factor)} "
         f"| {_ratio(row.expectancy_r)} | {row.total_trades} "
@@ -211,8 +257,7 @@ def sensitivity_to_markdown(report: SensitivityReport) -> str:
         f"- Perfil de costes: {parameters.cost_profile or NOT_AVAILABLE} "
         f"(comisión {_pct(parameters.costs.commission_rate)}, "
         f"slippage {_pct(parameters.costs.slippage_rate)})",
-        f"- Fijos: TP {parameters.risk.take_profit_atr_multiple} × ATR, "
-        f"riesgo {_pct(parameters.risk.risk_per_trade)} por operación, "
+        f"- Fijos: riesgo {_pct(parameters.risk.risk_per_trade)} por operación, "
         f"{parameters.risk.max_positions} posiciones, "
         f"anti-gap {parameters.gap_threshold_atr} × ATR",
         f"- Buy & Hold del periodo: {_pct(report.buy_and_hold_return)}",
@@ -220,9 +265,11 @@ def sensitivity_to_markdown(report: SensitivityReport) -> str:
         *sensitivity_table(report.rows),
         "",
         f"- Mayor retorno: SL {best_return.stop_loss_atr_multiple} × ATR, "
+        f"TP {best_return.take_profit_atr_multiple} × ATR, "
         f"exposición {_pct(best_return.max_position_exposure)} "
         f"({_pct(best_return.cumulative_return)}).",
         f"- Menor drawdown: SL {best_drawdown.stop_loss_atr_multiple} × ATR, "
+        f"TP {best_drawdown.take_profit_atr_multiple} × ATR, "
         f"exposición {_pct(best_drawdown.max_position_exposure)} "
         f"({_pct(best_drawdown.max_drawdown_pct)}).",
         "",

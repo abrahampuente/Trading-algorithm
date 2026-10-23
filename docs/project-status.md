@@ -720,6 +720,63 @@ IS anualizado medio 1.60 % → WFE 59.14 % (selección por Sharpe: OOS 4.08 %, W
 
 Lectura: el WFE supera el 50 %, pero se calcula sobre retornos anualizados muy pequeños (≈1-2 %), por lo que es sensible a pocas operaciones; la ventana 2024 fue negativa y los parámetros elegidos cambian entre ventanas. La estrategia conserva fuera de muestra parte de su ventaja, pero con un retorno absoluto muy inferior a Buy & Hold.
 
+### Universo diversificado y walk-forward ampliado (Ruta 1)
+
+Universos (`configs/environments/local.yaml`, `ApplicationSettings.universes`):
+
+```text
+initial      AAPL MSFT GOOGL SPY QQQ
+diversified  AAPL MSFT GOOGL QQQ SPY XOM JPM JNJ PG CAT GLD TLT XLE XLF XLV
+```
+
+- `algo-ingest --universe diversified` y `algo-backtest --universe diversified` (excluyente con `--symbols`; sin ninguno, `initial`). Con `--universe`, el nombre del universo sustituye a la lista de símbolos en el nombre de los informes.
+- Ingesta (2026-10-23, 112 s): 15 símbolos × 1711 barras (2020-01-02 → 2026-10-22, todas las sesiones NYSE), 25.665 barras raw y ajustadas, 419 acciones corporativas (3 splits: AAPL 4:1, GOOGL 20:1, XLE 2:1 el 2025-12-05) y 20 snapshots. XLE 2025-12-04: raw 92.22 → ajustado 46.11.
+
+Rejilla ampliada:
+
+- `ParameterGrid` tiene tres ejes: `stop_loss_atr_multiples`, `take_profit_atr_multiples` y `max_position_exposures`; `combinations()` devuelve `ParameterCombination` (orden SL → TP → exposición) con `apply(parameters)`.
+- El TP por defecto sigue en 2 × ATR (rejilla 3 × 3); `--tp-multiples 2.0 2.5 3.0` da la rejilla 3 × 3 × 3 (27 combinaciones). `--take-profit-atr` para ejecuciones individuales.
+- El walk-forward añade por periodo `time_in_market` y `average_exposure`, Buy & Hold equiponderado del universo por ventana OOS y para todo el periodo OOS (mismos costes, dividendos en cash), y una sección de uso de capital en el informe (`walk-forward-report-v2`).
+
+Ejecución (IS 36 / OOS 12, Profit Factor, perfil base, 27 combinaciones):
+
+```powershell
+algo-backtest --walk-forward --universe diversified --tp-multiples 2.0 2.5 3.0
+```
+
+Informe: `reports/walk_forward_diversified_2020-01-01_2026-10-22_base_is36-oos12_profit_factor.md` (201 s, 112 backtests).
+
+```text
+#  OOS                       Elegida (SL, TP, exp.)  Anual. IS  Anual. OOS  B&H OOS   PF OOS  Trades  WFE
+1  2023                      2.0, 3.0, 10 %          1.95 %     0.98 %      19.95 %   1.12    47       50.46 %
+2  2024                      2.0, 3.0, 15 %          2.32 %     5.29 %      18.95 %   1.55    53      227.76 %
+3  2025                      1.0, 3.0, 20 %          4.01 %     4.88 %      24.38 %   1.38    58      121.65 %
+4  2026-01-01 → 2026-10-22   1.0, 3.0, 20 %          4.80 %     0.16 %      17.06 %   1.01    50        3.28 %
+```
+
+Comparación con el universo inicial (misma rejilla de 27 combinaciones y periodo):
+
+```text
+                                 diversified (15)   initial (5)
+WFE global                       89.82 %            59.10 %
+Retorno acumulado OOS            11.66 %             3.66 %
+Retorno anualizado OOS            2.94 %             0.95 %
+MDD OOS                           4.12 %             2.96 %
+Profit Factor / Sharpe OOS       1.24 / 0.62        1.28 / 0.43
+Trades OOS                       208                85
+Tiempo en mercado                82.51 %            42.09 %
+Exposición media                 27.93 %             7.02 %
+Buy & Hold OOS (equiponderado)  108.77 %           164.57 %
+Exceso frente a Buy & Hold      -97.12 %          -160.91 %
+TP elegido                       3.0 en todas       2.0 en todas
+```
+
+Lectura:
+
+- Diversificar mejora claramente la estrategia: más señales independientes (208 trades frente a 85), el capital trabaja cuatro veces más (exposición media 28 % frente a 7 %) y el retorno OOS se triplica con un MDD todavía bajo (4,1 %). El WFE pasa de 59 % a 90 % y la combinación elegida es estable en TP (3 × ATR en todas las ventanas).
+- La ventana 2026 (parcial) casi no gana (WFE 3 %): el WFE global depende de pocas ventanas y conviene seguirlo con más historia.
+- Aun así, Buy & Hold diversificado (108,8 %) supera ampliamente a la estrategia (11,7 %) en este periodo alcista, con un MDD mucho mayor (15,3 %). El 72 % del capital sigue ocioso: el límite de 5 posiciones y el riesgo de 0,5 % por operación son ahora el principal freno al retorno absoluto.
+
 ### Métricas e informes (Hito 4)
 
 `calculate_performance_metrics(result, bars_by_symbol)` (`analytics/metrics.py`):
@@ -1045,10 +1102,11 @@ Completado:
 - Perfiles de costes optimista, base y conservador seleccionables desde la CLI.
 - Multiplicador de stop loss configurable y barrido de parámetros (SL × exposición) persistido con `sweep_id`.
 - Walk-Forward Optimization con curva OOS encadenada y Eficiencia Walk-Forward (`--walk-forward`).
+- Universo diversificado (15 símbolos) ingerido; rejilla con eje de TP; walk-forward con uso de capital y Buy & Hold diversificado.
 
 Orden inmediato:
 
-1. Ampliar el walk-forward: más activos (menos correlación), umbral anti-gap y TP en la rejilla, y persistir sus resultados si se quieren comparar desde MySQL.
+1. Uso del capital ocioso: evaluar en walk-forward más posiciones simultáneas y mayor riesgo por operación sobre el universo diversificado (manteniendo el MDD acotado), e incluir el umbral anti-gap en la rejilla.
 2. Reintentos con backoff para el proveedor real y validación de calidad de datos (saltos de precio, volumen cero).
 3. Decidir proveedor y granularidad intradía antes de implementar su adaptador y la simulación intradía (usando horarios y cierres tempranos del calendario).
 
@@ -1067,9 +1125,9 @@ Python: 3.13.3
 Sistema operativo: Windows 11
 IDE: VS Code
 Base de datos: MySQL 8.0 mediante Docker Compose
-Estado: v1 completa en datos diarios: ingesta real, calendario NYSE, dividendos, indicadores, señales Long, gestión monetaria, backtesting persistido, perfiles de costes, barridos de parámetros, walk-forward, métricas e informes
+Estado: v1 completa en datos diarios: ingesta real, calendario NYSE, dividendos, indicadores, señales Long, gestión monetaria, backtesting persistido, perfiles de costes, barridos de parámetros, walk-forward sobre universo diversificado, métricas e informes
 Validaciones: pytest, ruff y mypy están en verde
-Siguiente tarea: ampliar universo y rejilla del walk-forward
+Siguiente tarea: aprovechar el capital ocioso (posiciones simultáneas y riesgo por operación) en walk-forward
 Fuente de verdad: docs/project-status.md
 ```
 
@@ -1083,8 +1141,8 @@ ruff format --check .
 mypy src
 ```
 
-No regenerar módulos ya implementados. Continuar desde la ampliación del universo y de la rejilla del walk-forward.
+No regenerar módulos ya implementados. Continuar desde el aprovechamiento del capital ocioso en el walk-forward diversificado.
 
 Al abrir el siguiente chat, bastará con indicar:
 
-> Este proyecto continúa desde `docs/project-status.md`. Lee ese estado y no regeneres módulos ya implementados. El siguiente paso es ampliar el universo de activos y la rejilla del walk-forward.
+> Este proyecto continúa desde `docs/project-status.md`. Lee ese estado y no regeneres módulos ya implementados. El siguiente paso es evaluar en walk-forward más posiciones simultáneas y mayor riesgo por operación sobre el universo diversificado.

@@ -33,6 +33,9 @@ from typing import Self
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from algo_trading.analytics.metrics import (
+    BuyAndHoldComparison,
+    calculate_buy_and_hold,
+    calculate_curve_exposure,
     calculate_max_drawdown,
     calculate_trade_statistics,
 )
@@ -42,7 +45,10 @@ from algo_trading.backtesting.engine import (
     EquityPoint,
     ExecutionBar,
 )
-from algo_trading.backtesting.sensitivity import ParameterGrid
+from algo_trading.backtesting.sensitivity import (
+    ParameterCombination,
+    ParameterGrid,
+)
 from algo_trading.domain.corporate_actions.dto import CorporateDividend
 from algo_trading.execution.trade import Trade
 from algo_trading.portfolio.position_sizing import MONEY_PRECISION, MONEY_ROUNDING
@@ -123,6 +129,7 @@ class PeriodEvaluation(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     stop_loss_atr_multiple: Decimal
+    take_profit_atr_multiple: Decimal
     max_position_exposure: Decimal
     initial_equity: Decimal
     final_equity: Decimal
@@ -133,6 +140,16 @@ class PeriodEvaluation(BaseModel):
     sharpe_ratio: Decimal | None
     win_rate: Decimal | None
     total_trades: int = Field(ge=0)
+    time_in_market: Decimal | None = None
+    average_exposure: Decimal | None = None
+
+    @property
+    def combination(self) -> ParameterCombination:
+        return ParameterCombination(
+            stop_loss_atr_multiple=self.stop_loss_atr_multiple,
+            take_profit_atr_multiple=self.take_profit_atr_multiple,
+            max_position_exposure=self.max_position_exposure,
+        )
 
 
 class WalkForwardWindowResult(BaseModel):
@@ -143,12 +160,14 @@ class WalkForwardWindowResult(BaseModel):
     selected: PeriodEvaluation
     out_of_sample: PeriodEvaluation
     walk_forward_efficiency: Decimal | None
+    buy_and_hold_return: Decimal | None = None
 
 
 class WalkForwardReport(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    report_version: str = "walk-forward-report-v1"
+    report_version: str = "walk-forward-report-v2"
+    universe: str | None = None
     symbols: tuple[str, ...]
     trading_calendar: str | None
     base_parameters: BacktestParameters
@@ -159,6 +178,7 @@ class WalkForwardReport(BaseModel):
     out_of_sample_equity_curve: tuple[EquityPoint, ...]
     mean_in_sample_annualized_return: Decimal | None
     walk_forward_efficiency: Decimal | None
+    buy_and_hold: BuyAndHoldComparison | None = None
 
     @property
     def is_robust(self) -> bool | None:
@@ -385,8 +405,10 @@ class WalkForwardAnalyzer:
         curve = result.equity_curve
         last_date = curve[-1].timestamp.date() if curve else end
 
+        exposure = calculate_curve_exposure(curve)
         evaluation = PeriodEvaluation(
             stop_loss_atr_multiple=parameters.risk.stop_loss_atr_multiple,
+            take_profit_atr_multiple=parameters.risk.take_profit_atr_multiple,
             max_position_exposure=parameters.risk.max_position_exposure,
             initial_equity=initial_equity,
             final_equity=result.final_cash,
@@ -400,8 +422,34 @@ class WalkForwardAnalyzer:
             sharpe_ratio=sharpe_ratio(curve, initial_equity),
             win_rate=statistics.win_rate,
             total_trades=statistics.total_trades,
+            time_in_market=exposure.time_in_market,
+            average_exposure=exposure.average_exposure,
         )
         return evaluation, result.trades, curve
+
+    def buy_and_hold(
+        self,
+        parameters: BacktestParameters,
+        start: date,
+        end: date,
+        strategy_return: Decimal,
+    ) -> BuyAndHoldComparison | None:
+        """Buy & Hold equiponderado del universo en [start, end], mismos costes."""
+        bars = {
+            symbol: tuple(b for b in series if start <= b.timestamp.date() <= end)
+            for symbol, series in self._bars.items()
+        }
+        dividends = {
+            symbol: tuple(d for d in values if start <= d.ex_date <= end)
+            for symbol, values in self._dividends.items()
+        }
+        return calculate_buy_and_hold(
+            {symbol: series for symbol, series in bars.items() if series},
+            initial_equity=parameters.initial_cash,
+            costs=parameters.costs,
+            strategy_return=strategy_return,
+            dividends_by_symbol=dividends,
+        )
 
     def run(
         self,
@@ -409,6 +457,7 @@ class WalkForwardAnalyzer:
         config: WalkForwardConfig,
         start: date | None = None,
         end: date | None = None,
+        universe: str | None = None,
     ) -> WalkForwardReport:
         analysis_start = start or self.data_start
         analysis_end = end or self.data_end
@@ -434,26 +483,30 @@ class WalkForwardAnalyzer:
         for window in windows:
             in_sample = tuple(
                 self.evaluate(
-                    _with_risk(base_parameters, stop_loss, exposure),
+                    combination.apply(base_parameters),
                     window.in_sample_start,
                     window.in_sample_end,
                 )[0]
-                for stop_loss, exposure in config.grid.combinations()
+                for combination in config.grid.combinations()
             )
             selected = select_best(
                 in_sample,
                 config.selection_metric,
                 config.min_trades,
             )
-            oos_parameters = _with_risk(
-                base_parameters,
-                selected.stop_loss_atr_multiple,
-                selected.max_position_exposure,
-            ).model_copy(update={"initial_cash": oos_equity})
+            oos_parameters = selected.combination.apply(base_parameters).model_copy(
+                update={"initial_cash": oos_equity}
+            )
             out_of_sample, trades, curve = self.evaluate(
                 oos_parameters,
                 window.out_of_sample_start,
                 window.out_of_sample_end,
+            )
+            window_benchmark = self.buy_and_hold(
+                base_parameters,
+                window.out_of_sample_start,
+                window.out_of_sample_end,
+                out_of_sample.cumulative_return,
             )
             oos_equity = out_of_sample.final_equity
             oos_trades.extend(trades)
@@ -467,6 +520,11 @@ class WalkForwardAnalyzer:
                     walk_forward_efficiency=_efficiency(
                         out_of_sample.annualized_return,
                         selected.annualized_return,
+                    ),
+                    buy_and_hold_return=(
+                        window_benchmark.cumulative_return
+                        if window_benchmark is not None
+                        else None
                     ),
                 )
             )
@@ -491,8 +549,10 @@ class WalkForwardAnalyzer:
         last_oos = oos_curve[-1].timestamp.date() if oos_curve else analysis_end
         oos_annualized = annualized_return(cumulative, first_oos, last_oos)
         last_selected = window_results[-1].selected
+        oos_exposure = calculate_curve_exposure(oos_curve)
 
         return WalkForwardReport(
+            universe=universe,
             symbols=tuple(sorted(self._bars)),
             trading_calendar=self._calendar_name,
             base_parameters=base_parameters,
@@ -500,6 +560,7 @@ class WalkForwardAnalyzer:
             windows=tuple(window_results),
             out_of_sample=PeriodEvaluation(
                 stop_loss_atr_multiple=last_selected.stop_loss_atr_multiple,
+                take_profit_atr_multiple=last_selected.take_profit_atr_multiple,
                 max_position_exposure=last_selected.max_position_exposure,
                 initial_equity=initial_equity,
                 final_equity=oos_equity,
@@ -513,11 +574,19 @@ class WalkForwardAnalyzer:
                 sharpe_ratio=sharpe_ratio(oos_curve, initial_equity),
                 win_rate=statistics.win_rate,
                 total_trades=statistics.total_trades,
+                time_in_market=oos_exposure.time_in_market,
+                average_exposure=oos_exposure.average_exposure,
             ),
             out_of_sample_trades=tuple(oos_trades),
             out_of_sample_equity_curve=tuple(oos_curve),
             mean_in_sample_annualized_return=mean_in_sample,
             walk_forward_efficiency=_efficiency(oos_annualized, mean_in_sample),
+            buy_and_hold=self.buy_and_hold(
+                base_parameters,
+                first_oos,
+                windows[-1].out_of_sample_end,
+                cumulative,
+            ),
         )
 
 
@@ -525,6 +594,10 @@ def walk_forward_to_markdown(report: WalkForwardReport) -> str:
     config = report.config
     parameters = report.base_parameters
     oos = report.out_of_sample
+    benchmark = report.buy_and_hold
+    idle_capital = (
+        1 - oos.average_exposure if oos.average_exposure is not None else None
+    )
     first_window = report.windows[0].window
     last_window = report.windows[-1].window
     verdict = {
@@ -536,6 +609,8 @@ def walk_forward_to_markdown(report: WalkForwardReport) -> str:
     lines = [
         "# Walk-Forward Optimization",
         "",
+        f"- Universo: {report.universe or 'símbolos explícitos'} "
+        f"({len(report.symbols)} símbolos)",
         f"- Símbolos: {', '.join(report.symbols)}",
         f"- Calendario de mercado: {report.trading_calendar or 'sin calendario'}",
         f"- Ventanas: IS {config.in_sample_months} meses, OOS "
@@ -545,27 +620,40 @@ def walk_forward_to_markdown(report: WalkForwardReport) -> str:
         f"mínimo {config.min_trades} trades",
         "- Rejilla: SL × ATR "
         + ", ".join(str(value) for value in config.grid.stop_loss_atr_multiples)
+        + "; TP × ATR "
+        + ", ".join(str(value) for value in config.grid.take_profit_atr_multiples)
         + "; exposición "
-        + ", ".join(_pct(value) for value in config.grid.max_position_exposures),
-        f"- Perfil de costes: {parameters.cost_profile or NOT_AVAILABLE}; "
-        f"TP {parameters.risk.take_profit_atr_multiple} × ATR; anti-gap "
+        + ", ".join(_pct(value) for value in config.grid.max_position_exposures)
+        + f" ({len(config.grid.combinations())} combinaciones)",
+        f"- Perfil de costes: {parameters.cost_profile or NOT_AVAILABLE}; anti-gap "
         f"{parameters.gap_threshold_atr} × ATR",
         f"- Periodo OOS: {first_window.out_of_sample_start} → "
         f"{last_window.out_of_sample_end}",
         "",
         "## Resultado fuera de muestra",
         "",
+        "| Métrica | Estrategia (OOS encadenado) | Buy & Hold diversificado |",
+        "| --- | --- | --- |",
+        f"| Capital inicial | {_money(oos.initial_equity)} | "
+        f"{_money(benchmark.initial_equity if benchmark else None)} |",
+        f"| Equity final | {_money(oos.final_equity)} | "
+        f"{_money(benchmark.final_equity if benchmark else None)} |",
+        f"| Retorno acumulado | {_pct(oos.cumulative_return)} | "
+        f"{_pct(benchmark.cumulative_return if benchmark else None)} |",
+        f"| Maximum Drawdown | {_pct(oos.max_drawdown_pct)} | "
+        f"{_pct(benchmark.max_drawdown.max_drawdown_pct if benchmark else None)} |",
+        f"| Dividendos | incluidos en el PnL | "
+        f"{_money(benchmark.dividend_income if benchmark else None)} |",
+        "",
         "| Métrica | Valor |",
         "| --- | --- |",
-        f"| Capital inicial | {_money(oos.initial_equity)} |",
-        f"| Equity final OOS | {_money(oos.final_equity)} |",
-        f"| Retorno acumulado OOS | {_pct(oos.cumulative_return)} |",
         f"| Retorno anualizado OOS | {_pct(oos.annualized_return)} |",
         f"| Retorno anualizado IS medio (seleccionados) | "
         f"{_pct(report.mean_in_sample_annualized_return)} |",
         f"| **Eficiencia Walk-Forward (WFE)** | "
         f"**{_pct(report.walk_forward_efficiency)}** |",
-        f"| Maximum Drawdown OOS | {_pct(oos.max_drawdown_pct)} |",
+        f"| Exceso de retorno frente a Buy & Hold | "
+        f"{_pct(benchmark.strategy_excess_return if benchmark else None)} |",
         f"| Profit Factor OOS | {_ratio(oos.profit_factor)} |",
         f"| Sharpe OOS | {_ratio(oos.sharpe_ratio)} |",
         f"| Win Rate OOS | {_pct(oos.win_rate)} |",
@@ -573,13 +661,22 @@ def walk_forward_to_markdown(report: WalkForwardReport) -> str:
         "",
         f"Veredicto: {verdict}.",
         "",
+        "## Uso de capital fuera de muestra",
+        "",
+        "| Métrica | Valor |",
+        "| --- | --- |",
+        f"| Tiempo en mercado (sesiones con posiciones) | {_pct(oos.time_in_market)} |",
+        f"| Exposición media (valor de mercado / equity) | "
+        f"{_pct(oos.average_exposure)} |",
+        f"| Capital ocioso medio | {_pct(idle_capital)} |",
+        "",
         "## Ventanas",
         "",
-        "| # | IS | OOS | SL × ATR | Exposición | PF IS | Sharpe IS "
-        "| Anual. IS | Anual. OOS | Retorno OOS | MDD OOS | PF OOS | Trades OOS "
-        "| WFE |",
+        "| # | IS | OOS | SL × ATR | TP × ATR | Exposición | PF IS | Sharpe IS "
+        "| Anual. IS | Anual. OOS | Retorno OOS | B&H OOS | MDD OOS | PF OOS "
+        "| Tiempo en mercado | Exposición media | Trades OOS | WFE |",
         "| ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: "
-        "| ---: | ---: | ---: | ---: |",
+        "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
 
     for result in report.windows:
@@ -591,11 +688,14 @@ def walk_forward_to_markdown(report: WalkForwardReport) -> str:
             f"| {window.index} | {window.in_sample_start} → {window.in_sample_end} "
             f"| {window.out_of_sample_start} → {window.out_of_sample_end}{partial} "
             f"| {selected.stop_loss_atr_multiple} "
+            f"| {selected.take_profit_atr_multiple} "
             f"| {_pct(selected.max_position_exposure)} "
             f"| {_ratio(selected.profit_factor)} | {_ratio(selected.sharpe_ratio)} "
             f"| {_pct(selected.annualized_return)} | {_pct(out.annualized_return)} "
-            f"| {_pct(out.cumulative_return)} | {_pct(out.max_drawdown_pct)} "
-            f"| {_ratio(out.profit_factor)} | {out.total_trades} "
+            f"| {_pct(out.cumulative_return)} | {_pct(result.buy_and_hold_return)} "
+            f"| {_pct(out.max_drawdown_pct)} "
+            f"| {_ratio(out.profit_factor)} | {_pct(out.time_in_market)} "
+            f"| {_pct(out.average_exposure)} | {out.total_trades} "
             f"| {_pct(result.walk_forward_efficiency)} |"
         )
 
@@ -608,14 +708,15 @@ def walk_forward_to_markdown(report: WalkForwardReport) -> str:
                 f"### Ventana {window.index}: IS {window.in_sample_start} → "
                 f"{window.in_sample_end}",
                 "",
-                "| SL × ATR | Exposición | Retorno | Anualizado | MDD | PF | Sharpe "
-                "| Win Rate | Trades | Elegida |",
+                "| SL × ATR | TP × ATR | Exposición | Retorno | Anualizado | MDD "
+                "| PF | Sharpe | Win Rate | Trades | Elegida |",
                 "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: "
-                "| :---: |",
+                "| ---: | :---: |",
             ]
         )
         lines.extend(
-            f"| {e.stop_loss_atr_multiple} | {_pct(e.max_position_exposure)} "
+            f"| {e.stop_loss_atr_multiple} | {e.take_profit_atr_multiple} "
+            f"| {_pct(e.max_position_exposure)} "
             f"| {_pct(e.cumulative_return)} | {_pct(e.annualized_return)} "
             f"| {_pct(e.max_drawdown_pct)} | {_ratio(e.profit_factor)} "
             f"| {_ratio(e.sharpe_ratio)} | {_pct(e.win_rate)} | {e.total_trades} "
@@ -637,6 +738,12 @@ def walk_forward_to_markdown(report: WalkForwardReport) -> str:
             "- WFE = retorno anualizado OOS / retorno anualizado IS. Por ventana "
             "usa la combinación elegida; el global usa la curva OOS encadenada y "
             "la media de los IS elegidos.",
+            "- Buy & Hold diversificado: capital repartido a partes iguales entre "
+            "todos los símbolos, comprado en la primera apertura del periodo OOS "
+            "y vendido al último cierre, con los mismos costes y dividendos en "
+            "cash (por ventana y para todo el periodo OOS).",
+            "- Uso de capital: tiempo en mercado = sesiones con alguna posición "
+            "abierta; exposición media = media diaria de valor de mercado / equity.",
             "",
         ]
     )
@@ -654,23 +761,6 @@ def write_walk_forward_report(
     json_path.write_text(report.model_dump_json(indent=2), encoding="utf-8")
     markdown_path.write_text(walk_forward_to_markdown(report), encoding="utf-8")
     return json_path, markdown_path
-
-
-def _with_risk(
-    parameters: BacktestParameters,
-    stop_loss_atr_multiple: Decimal,
-    max_position_exposure: Decimal,
-) -> BacktestParameters:
-    return parameters.model_copy(
-        update={
-            "risk": parameters.risk.model_copy(
-                update={
-                    "stop_loss_atr_multiple": stop_loss_atr_multiple,
-                    "max_position_exposure": max_position_exposure,
-                }
-            )
-        }
-    )
 
 
 def _efficiency(

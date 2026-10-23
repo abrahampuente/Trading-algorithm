@@ -125,6 +125,7 @@ def evaluation(
 ) -> PeriodEvaluation:
     return PeriodEvaluation(
         stop_loss_atr_multiple=Decimal(stop_loss),
+        take_profit_atr_multiple=Decimal("2"),
         max_position_exposure=Decimal("0.10"),
         initial_equity=Decimal("100"),
         final_equity=Decimal("110"),
@@ -360,3 +361,49 @@ def test_markdown_report_sections(report: WalkForwardReport) -> None:
         assert section in markdown
     assert markdown.count("### Ventana ") == len(report.windows)
     assert markdown.count("| ✓ |") == len(report.windows)
+
+
+def test_report_includes_capital_usage_and_buy_and_hold(
+    report: WalkForwardReport,
+) -> None:
+    oos = report.out_of_sample
+    benchmark = report.buy_and_hold
+
+    assert oos.time_in_market is not None
+    assert 0 <= oos.time_in_market <= 1
+    assert oos.average_exposure is not None
+    assert 0 <= oos.average_exposure <= 1
+    assert benchmark is not None
+    assert benchmark.initial_equity == PARAMETERS.initial_cash
+    assert benchmark.strategy_excess_return == (
+        oos.cumulative_return - benchmark.cumulative_return
+    )
+    assert all(result.buy_and_hold_return is not None for result in report.windows)
+
+    markdown = walk_forward_to_markdown(report)
+    assert "## Uso de capital fuera de muestra" in markdown
+    assert "Buy & Hold diversificado" in markdown
+
+
+def test_take_profit_axis_is_evaluated_and_selected() -> None:
+    config = CONFIG.model_copy(
+        update={
+            "grid": ParameterGrid(
+                stop_loss_atr_multiples=(Decimal("1"),),
+                take_profit_atr_multiples=(Decimal("2"), Decimal("3")),
+                max_position_exposures=(Decimal("0.10"),),
+            )
+        }
+    )
+
+    result = WalkForwardAnalyzer(synthetic_bars()).run(PARAMETERS, config)
+
+    for window in result.windows:
+        assert [e.take_profit_atr_multiple for e in window.in_sample] == [
+            Decimal("2"),
+            Decimal("3"),
+        ]
+        assert window.selected.take_profit_atr_multiple in {Decimal("2"), Decimal("3")}
+        assert window.out_of_sample.take_profit_atr_multiple == (
+            window.selected.take_profit_atr_multiple
+        )

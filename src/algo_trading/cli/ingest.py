@@ -5,6 +5,7 @@ Uso:
 
     python -m algo_trading.cli.ingest
     python -m algo_trading.cli.ingest --symbols AAPL MSFT --start 2020-01-01
+    python -m algo_trading.cli.ingest --universe diversified
 
 Para cada símbolo:
 
@@ -22,6 +23,7 @@ import argparse
 from collections.abc import Callable, Sequence
 from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
+from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy.orm import Session
@@ -45,7 +47,11 @@ from algo_trading.persistence.repositories.market_bar_query_repository import (
     RawMarketBarQueryRepository,
 )
 
+if TYPE_CHECKING:
+    from algo_trading.config.settings import ApplicationSettings
+
 DEFAULT_SYMBOLS = ("AAPL", "MSFT", "GOOGL", "SPY", "QQQ")
+DEFAULT_UNIVERSE = "initial"
 DEFAULT_START = date(2020, 1, 1)
 DEFAULT_ADJUSTMENT_VERSION = "splits-v1"
 DAILY = Timeframe.DAILY.value
@@ -228,11 +234,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         prog="algo-ingest",
         description="Descarga datos diarios de Yahoo Finance y puebla MySQL.",
     )
-    parser.add_argument(
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument(
         "--symbols",
         nargs="+",
-        default=list(DEFAULT_SYMBOLS),
-        help="Símbolos a ingerir (por defecto: %(default)s).",
+        default=None,
+        help="Símbolos a ingerir.",
+    )
+    selection.add_argument(
+        "--universe",
+        default=None,
+        help="Universo de la configuración (por defecto: initial).",
     )
     parser.add_argument(
         "--start",
@@ -254,9 +266,23 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def resolve_symbols(
+    arguments: argparse.Namespace,
+    settings: "ApplicationSettings",
+) -> tuple[str, ...]:
+    """`--symbols` explícitos, o los del `--universe` (por defecto `initial`)."""
+    if arguments.symbols:
+        return tuple(symbol.upper() for symbol in arguments.symbols)
+
+    return settings.universe(arguments.universe or DEFAULT_UNIVERSE)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = parse_args(argv)
-    symbols = [symbol.upper() for symbol in arguments.symbols]
+
+    from algo_trading.config.settings import ApplicationSettings
+
+    symbols = list(resolve_symbols(arguments, ApplicationSettings.from_yaml()))
     end: date = arguments.end or default_end_date()
     provider = YFinanceProvider()
 

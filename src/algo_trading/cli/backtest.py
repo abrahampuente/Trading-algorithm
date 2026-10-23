@@ -9,6 +9,7 @@ Uso:
     algo-backtest --sweep
     algo-backtest --sweep --sl-multiples 1 2 --exposures 0.10 0.20
     algo-backtest --walk-forward --is-months 36 --oos-months 12
+    algo-backtest --walk-forward --universe diversified --tp-multiples 2 2.5 3
     algo-backtest --list-runs 10
 
 Lee `market_bars_adjusted` y los dividendos, valida las series contra el
@@ -52,6 +53,7 @@ from algo_trading.backtesting.run_service import (
 from algo_trading.backtesting.sensitivity import (
     DEFAULT_MAX_POSITION_EXPOSURES,
     DEFAULT_STOP_LOSS_ATR_MULTIPLES,
+    DEFAULT_TAKE_PROFIT_ATR_MULTIPLES,
     ParameterGrid,
     SensitivityAnalysisService,
     SensitivityReport,
@@ -61,7 +63,7 @@ from algo_trading.backtesting.sensitivity import (
 from algo_trading.cli.ingest import (
     DEFAULT_ADJUSTMENT_VERSION,
     DEFAULT_START,
-    DEFAULT_SYMBOLS,
+    DEFAULT_UNIVERSE,
     default_end_date,
 )
 from algo_trading.config.settings import (
@@ -87,7 +89,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         prog="algo-backtest",
         description="Ejecuta el backtest v1 sobre barras ajustadas de MySQL.",
     )
-    parser.add_argument("--symbols", nargs="+", default=list(DEFAULT_SYMBOLS))
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument("--symbols", nargs="+", default=None)
+    selection.add_argument(
+        "--universe",
+        default=None,
+        help="Universo de la configuración (por defecto: initial).",
+    )
     parser.add_argument("--start", type=date.fromisoformat, default=DEFAULT_START)
     parser.add_argument(
         "--end",
@@ -112,6 +120,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=Decimal,
         default=Decimal("1"),
         help="Multiplicador de ATR para el stop loss (v1: 1).",
+    )
+    parser.add_argument(
+        "--take-profit-atr",
+        type=Decimal,
+        default=Decimal("2"),
+        help="Multiplicador de ATR para el take profit (v1: 2).",
     )
     parser.add_argument(
         "--max-position-exposure",
@@ -147,6 +161,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=Decimal,
         default=list(DEFAULT_STOP_LOSS_ATR_MULTIPLES),
         help="Multiplicadores de stop loss del barrido (por defecto: 1.0 1.5 2.0).",
+    )
+    parser.add_argument(
+        "--tp-multiples",
+        nargs="+",
+        type=Decimal,
+        default=list(DEFAULT_TAKE_PROFIT_ATR_MULTIPLES),
+        help="Multiplicadores de take profit de la rejilla (por defecto: 2.0).",
     )
     parser.add_argument(
         "--exposures",
@@ -237,13 +258,14 @@ def build_request(
             max_positions=settings.max_positions,
             max_position_exposure=arguments.max_position_exposure,
             stop_loss_atr_multiple=arguments.stop_loss_atr,
+            take_profit_atr_multiple=arguments.take_profit_atr,
             commission_rate=costs.commission_rate,
         ),
         costs=costs,
         gap_threshold_atr=arguments.gap_threshold_atr,
     )
     return BacktestRunRequest(
-        symbols=tuple(symbol.upper() for symbol in arguments.symbols),
+        symbols=resolve_symbols(arguments, settings),
         start=arguments.start,
         end=arguments.end or default_end_date(),
         parameters=parameters,
@@ -251,6 +273,34 @@ def build_request(
         adjustment_version=arguments.adjustment_version,
         include_dividends=not arguments.no_dividends,
     )
+
+
+def resolve_symbols(
+    arguments: argparse.Namespace,
+    settings: ApplicationSettings,
+) -> tuple[str, ...]:
+    """`--symbols` explícitos, o los del `--universe` (por defecto `initial`)."""
+    if arguments.symbols:
+        return tuple(symbol.upper() for symbol in arguments.symbols)
+
+    return settings.universe(arguments.universe or DEFAULT_UNIVERSE)
+
+
+def report_label(
+    prefix: str,
+    arguments: argparse.Namespace,
+    request: BacktestRunRequest,
+) -> str:
+    """`<prefijo>_<universo o símbolos>_<inicio>_<fin>`."""
+    if arguments.universe:
+        return (
+            f"{prefix}_{arguments.universe.lower()}_"
+            f"{request.start.isoformat()}_{request.end.isoformat()}"
+        )
+
+    return prefix + default_report_name(
+        request.symbols, request.start, request.end
+    ).removeprefix("backtest")
 
 
 def run_backtest_command(
@@ -267,9 +317,7 @@ def run_backtest_command(
             persist=not arguments.no_persist,
         )
 
-    name = arguments.name or default_report_name(
-        request.symbols, request.start, request.end
-    )
+    name = arguments.name or report_label("backtest", arguments, request)
     json_path, markdown_path = write_report(outcome.report, arguments.output_dir, name)
     return outcome, json_path, markdown_path
 
@@ -283,6 +331,7 @@ def run_sweep_command(
     request = build_request(arguments, settings)
     grid = ParameterGrid(
         stop_loss_atr_multiples=tuple(arguments.sl_multiples),
+        take_profit_atr_multiples=tuple(arguments.tp_multiples),
         max_position_exposures=tuple(arguments.exposures),
     )
 
@@ -292,10 +341,7 @@ def run_sweep_command(
         ).run(request, grid, persist=not arguments.no_persist)
 
     name = arguments.name or (
-        "sensitivity_"
-        + default_report_name(request.symbols, request.start, request.end).removeprefix(
-            "backtest_"
-        )
+        report_label("sensitivity", arguments, request)
         + f"_{request.parameters.cost_profile}"
     )
     json_path, markdown_path = write_sensitivity_report(
@@ -322,6 +368,7 @@ def run_walk_forward_command(
         min_trades=arguments.min_trades,
         grid=ParameterGrid(
             stop_loss_atr_multiples=tuple(arguments.sl_multiples),
+            take_profit_atr_multiples=tuple(arguments.tp_multiples),
             max_position_exposures=tuple(arguments.exposures),
         ),
     )
@@ -334,13 +381,16 @@ def run_walk_forward_command(
         dividends_by_symbol=data.dividends_by_symbol,
         trading_sessions=data.trading_sessions,
         trading_calendar=calendar.name if calendar is not None else None,
-    ).run(request.parameters, config, start=request.start, end=request.end)
+    ).run(
+        request.parameters,
+        config,
+        start=request.start,
+        end=request.end,
+        universe=arguments.universe.lower() if arguments.universe else None,
+    )
 
     name = arguments.name or (
-        "walk_forward_"
-        + default_report_name(request.symbols, request.start, request.end).removeprefix(
-            "backtest_"
-        )
+        report_label("walk_forward", arguments, request)
         + f"_{request.parameters.cost_profile}"
         + f"_is{config.in_sample_months}-oos{config.out_of_sample_months}"
         + f"_{config.selection_metric}"
@@ -426,7 +476,7 @@ def format_walk_forward_summary(
         f"Símbolos: {', '.join(report.symbols)}  "
         f"Costes: {report.base_parameters.cost_profile}",
         "",
-        f"{'#':>2} {'OOS':<25} {'SL':>4} {'exp.':>7} {'anual. IS':>10} "
+        f"{'#':>2} {'OOS':<25} {'SL':>4} {'TP':>4} {'exp.':>7} {'anual. IS':>10} "
         f"{'anual. OOS':>10} {'PF OOS':>6} {'trades':>6} {'WFE':>9}",
     ]
 
@@ -436,6 +486,7 @@ def format_walk_forward_summary(
             f"{window.index:>2} {window.out_of_sample_start} → "
             f"{window.out_of_sample_end} "
             f"{result.selected.stop_loss_atr_multiple!s:>4} "
+            f"{result.selected.take_profit_atr_multiple!s:>4} "
             f"{_pct(result.selected.max_position_exposure):>7} "
             f"{_pct(result.selected.annualized_return):>10} "
             f"{_pct(result.out_of_sample.annualized_return):>10} "
@@ -445,6 +496,9 @@ def format_walk_forward_summary(
         )
 
     robust = {True: "sí", False: "no", None: "n/d"}[report.is_robust]
+    benchmark = report.buy_and_hold
+    benchmark_return = benchmark.cumulative_return if benchmark else None
+    excess_return = benchmark.strategy_excess_return if benchmark else None
     lines.extend(
         [
             "",
@@ -455,6 +509,10 @@ def format_walk_forward_summary(
             f"IS anualizado medio: {_pct(report.mean_in_sample_annualized_return)}  "
             f"WFE: {_pct(report.walk_forward_efficiency)}  "
             f"Robusta (WFE > 50 %): {robust}",
+            f"Uso de capital OOS: tiempo en mercado {_pct(oos.time_in_market)}  "
+            f"exposición media {_pct(oos.average_exposure)}",
+            f"Buy & Hold OOS: {_pct(benchmark_return)}  "
+            f"Exceso de la estrategia: {_pct(excess_return)}",
             f"Informe JSON: {json_path}",
             f"Informe Markdown: {markdown_path}",
         ]

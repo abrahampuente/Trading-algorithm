@@ -22,3 +22,27 @@ cost_profiles:
   conservador:
     commission_rate: 0.0010
     slippage_rate: 0.0010
+
+# Universos de símbolos (--universe en algo-ingest y algo-backtest).
+universes:
+  initial: [AAPL, MSFT, GOOGL, SPY, QQQ]
+  diversified:
+    # Tecnología e índices
+    - AAPL
+    - MSFT
+    - GOOGL
+    - QQQ
+    - SPY
+    # Energía, finanzas, salud, consumo e industria
+    - XOM
+    - JPM
+    - JNJ
+    - PG
+    - CAT
+    # Oro y bonos del Tesoro largos
+    - GLD
+    - TLT
+    # ETFs sectoriales
+    - XLE
+    - XLF
+    - XLV

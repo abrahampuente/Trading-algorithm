@@ -5,7 +5,11 @@ from decimal import Decimal, localcontext
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from algo_trading.backtesting.engine import BacktestResult, ExecutionBar
+from algo_trading.backtesting.engine import (
+    BacktestResult,
+    EquityPoint,
+    ExecutionBar,
+)
 from algo_trading.domain.corporate_actions.dto import CorporateDividend
 from algo_trading.execution.costs import CostModel
 from algo_trading.execution.trade import Trade
@@ -182,8 +186,11 @@ def calculate_max_drawdown(
 
 
 def calculate_exposure(result: BacktestResult) -> Exposure:
-    points = result.equity_curve
+    return calculate_curve_exposure(result.equity_curve)
 
+
+def calculate_curve_exposure(points: Sequence[EquityPoint]) -> Exposure:
+    """Tiempo en mercado y exposición media (`valor_mercado / equity`)."""
     if not points:
         return Exposure(time_in_market=None, average_exposure=None)
 

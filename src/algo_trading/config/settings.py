@@ -38,6 +38,33 @@ def default_cost_profiles() -> dict[str, CostProfileSettings]:
     }
 
 
+DEFAULT_UNIVERSE = "initial"
+
+
+def default_universes() -> dict[str, tuple[str, ...]]:
+    """Universos de símbolos reutilizables por las CLIs."""
+    return {
+        "initial": ("AAPL", "MSFT", "GOOGL", "SPY", "QQQ"),
+        "diversified": (
+            "AAPL",
+            "MSFT",
+            "GOOGL",
+            "QQQ",
+            "SPY",
+            "XOM",
+            "JPM",
+            "JNJ",
+            "PG",
+            "CAT",
+            "GLD",
+            "TLT",
+            "XLE",
+            "XLF",
+            "XLV",
+        ),
+    }
+
+
 class DatabaseSettings(BaseModel):
     host: str
     port: int = Field(gt=0, le=65535)
@@ -67,6 +94,10 @@ class ApplicationSettings(BaseSettings):
         default_factory=default_cost_profiles,
         min_length=1,
     )
+    universes: dict[str, tuple[str, ...]] = Field(
+        default_factory=default_universes,
+        min_length=1,
+    )
 
     database_password: str | None = None
 
@@ -90,6 +121,20 @@ class ApplicationSettings(BaseSettings):
             settings.database.password = settings.database_password
 
         return settings
+
+    def universe(self, name: str) -> tuple[str, ...]:
+        """Símbolos de un universo (nombre sin distinguir mayúsculas)."""
+        universes = {key.lower(): value for key, value in self.universes.items()}
+
+        try:
+            symbols = universes[name.lower()]
+        except KeyError:
+            available = ", ".join(sorted(self.universes))
+            raise ValueError(
+                f"Universo desconocido: {name}. Disponibles: {available}"
+            ) from None
+
+        return tuple(symbol.upper() for symbol in symbols)
 
     def cost_profile(self, name: str) -> CostProfileSettings:
         """Devuelve un perfil de costes por nombre (sin distinguir mayúsculas)."""

@@ -402,7 +402,10 @@ def test_cli_no_persist_and_no_dividends(engine: Engine, tmp_path: Path) -> None
 def test_cli_defaults() -> None:
     arguments = parse_args([])
 
-    assert arguments.symbols == ["AAPL", "MSFT", "GOOGL", "SPY", "QQQ"]
+    assert arguments.symbols is None
+    assert arguments.universe is None
+    assert arguments.take_profit_atr == Decimal("2")
+    assert arguments.tp_multiples == [Decimal("2.0")]
     assert arguments.start == date(2020, 1, 1)
     assert arguments.end is None
     assert arguments.initial_cash is None
@@ -573,9 +576,7 @@ def test_cli_sweep_runs_grid_and_persists_runs_with_shared_sweep_id(
     assert json_path.name == "sensitivity_AAA_2024-01-01_2024-01-23_base.json"
     markdown = markdown_path.read_text(encoding="utf-8")
     assert markdown.startswith("# Análisis de sensibilidad")
-    assert "| SL × ATR | Exposición | Retorno | MDD | Win Rate | Profit Factor" in (
-        markdown
-    )
+    assert "| SL × ATR | TP × ATR | Exposición | Retorno | MDD | Win Rate" in (markdown)
     assert "Barrido: " in format_sweep_summary(report, json_path, markdown_path)
 
     with Session(engine) as session:
@@ -610,3 +611,74 @@ def test_sweep_varies_results_with_parameters(engine: Engine, tmp_path: Path) ->
         if row.stop_loss_atr_multiple == Decimal("1.0")
     }
     assert by_exposure[Decimal("0.20")] > by_exposure[Decimal("0.10")]
+
+
+def test_sweep_includes_take_profit_axis(engine: Engine, tmp_path: Path) -> None:
+    report, _, markdown_path = run_sweep_command(
+        parse_args(
+            cli_arguments(
+                tmp_path,
+                "--sweep",
+                "--no-persist",
+                "--sl-multiples",
+                "1",
+                "--tp-multiples",
+                "2",
+                "3",
+                "--exposures",
+                "0.10",
+            )
+        ),
+        session_factory=sessionmaker(bind=engine),
+        settings=SETTINGS,
+        calendar=None,
+    )
+
+    assert [row.take_profit_atr_multiple for row in report.rows] == [
+        Decimal("2"),
+        Decimal("3"),
+    ]
+    # El escenario cierra en TP con 2 x ATR; con 3 x ATR no se alcanza (fin de datos).
+    assert report.rows[0].cumulative_return != report.rows[1].cumulative_return
+    assert "| 1 | 3 | 10.00 % |" in markdown_path.read_text(encoding="utf-8")
+
+
+def test_cli_applies_take_profit_multiple(engine: Engine, tmp_path: Path) -> None:
+    outcome, _, _ = run_backtest_command(
+        parse_args(cli_arguments(tmp_path, "--take-profit-atr", "3", "--no-persist")),
+        session_factory=sessionmaker(bind=engine),
+        settings=SETTINGS,
+        calendar=None,
+    )
+
+    trade = outcome.report.trades[0]
+    assert outcome.report.parameters.risk.take_profit_atr_multiple == Decimal("3")
+    assert trade.take_profit == trade.entry_executed_price + 3 * trade.entry_atr
+
+
+def test_universe_label_is_used_in_report_names(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    settings = SETTINGS.model_copy(update={"universes": {"tiny": ("AAA",)}})
+
+    _, json_path, _ = run_backtest_command(
+        parse_args(
+            [
+                "--universe",
+                "tiny",
+                "--start",
+                "2024-01-01",
+                "--end",
+                "2024-01-23",
+                "--output-dir",
+                str(tmp_path),
+                "--no-persist",
+            ]
+        ),
+        session_factory=sessionmaker(bind=engine),
+        settings=settings,
+        calendar=None,
+    )
+
+    assert json_path.name == "backtest_tiny_2024-01-01_2024-01-23.json"

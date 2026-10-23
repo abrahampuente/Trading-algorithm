@@ -10,8 +10,10 @@ from algo_trading.cli.ingest import (
     IngestionStatus,
     format_results,
     parse_args,
+    resolve_symbols,
     run_ingestion,
 )
+from algo_trading.config.settings import ApplicationSettings
 from algo_trading.data.providers.yfinance import (
     YahooCorporateEvent,
     YahooDailyRow,
@@ -22,6 +24,8 @@ from algo_trading.persistence.models import Base
 from algo_trading.persistence.models.adjusted_market_data import MarketBarAdjusted
 from algo_trading.persistence.models.data_snapshot import DataSnapshotModel
 from algo_trading.persistence.models.market_data import MarketBarRaw
+
+SETTINGS = ApplicationSettings.from_yaml()
 
 SESSIONS = (
     date(2020, 8, 27),
@@ -210,7 +214,15 @@ def test_rejects_end_before_start(engine: Engine) -> None:
 def test_parse_args_defaults_to_initial_universe() -> None:
     arguments = parse_args([])
 
-    assert arguments.symbols == ["AAPL", "MSFT", "GOOGL", "SPY", "QQQ"]
+    assert arguments.symbols is None
+    assert arguments.universe is None
+    assert resolve_symbols(arguments, SETTINGS) == (
+        "AAPL",
+        "MSFT",
+        "GOOGL",
+        "SPY",
+        "QQQ",
+    )
     assert arguments.start == date(2020, 1, 1)
     assert arguments.end is None
     assert arguments.adjustment_version == "splits-v1"
@@ -224,3 +236,30 @@ def test_parse_args_accepts_custom_window() -> None:
     assert arguments.symbols == ["aapl"]
     assert arguments.start == date(2021, 1, 4)
     assert arguments.end == date(2021, 12, 31)
+
+
+def test_resolve_symbols_from_diversified_universe() -> None:
+    symbols = resolve_symbols(parse_args(["--universe", "Diversified"]), SETTINGS)
+
+    assert len(symbols) == 15
+    assert symbols[:5] == ("AAPL", "MSFT", "GOOGL", "QQQ", "SPY")
+    assert {"XOM", "JPM", "JNJ", "PG", "CAT", "GLD", "TLT", "XLE", "XLF", "XLV"} <= (
+        set(symbols)
+    )
+
+
+def test_explicit_symbols_take_precedence_and_are_uppercased() -> None:
+    assert resolve_symbols(parse_args(["--symbols", "aapl", "tlt"]), SETTINGS) == (
+        "AAPL",
+        "TLT",
+    )
+
+
+def test_symbols_and_universe_are_mutually_exclusive() -> None:
+    with pytest.raises(SystemExit):
+        parse_args(["--symbols", "AAPL", "--universe", "initial"])
+
+
+def test_unknown_universe_lists_available() -> None:
+    with pytest.raises(ValueError, match="diversified, initial"):
+        resolve_symbols(parse_args(["--universe", "global"]), SETTINGS)

@@ -38,3 +38,26 @@ def test_unknown_cost_profile_lists_available_profiles() -> None:
 
 def test_default_cost_profiles_match_local_configuration() -> None:
     assert default_cost_profiles() == ApplicationSettings.from_yaml().cost_profiles
+
+
+def test_local_settings_define_initial_and_diversified_universes() -> None:
+    settings = ApplicationSettings.from_yaml()
+
+    assert settings.universe("initial") == ("AAPL", "MSFT", "GOOGL", "SPY", "QQQ")
+    assert settings.universe("diversified") == (
+        "AAPL",
+        "MSFT",
+        "GOOGL",
+        "QQQ",
+        "SPY",
+        "XOM",
+        "JPM",
+        "JNJ",
+        "PG",
+        "CAT",
+        "GLD",
+        "TLT",
+        "XLE",
+        "XLF",
+        "XLV",
+    )
