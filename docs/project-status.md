@@ -1,6 +1,22 @@
 # Estado del proyecto — Algo Trading
 
-## Estado actual: v1 cerrada (2026-10-23)
+## Estado actual: v2 en diseño (iniciado 2026-10-23)
+
+La especificación técnica de la v2 está en `docs/technical-spec-v2.md`. Cubre cuatro ejes: señales multi-factor (fuerza relativa sectorial, filtros de volumen y régimen, Short y reversión a la media), precisión intradía (resolución SL/TP con barras de 1m, correlación de cartera y costes dinámicos), paper trading en una cuenta demo de broker (Alpaca Paper, con órdenes, fills, latencia y slippage real) y telemetría con notificaciones.
+
+Roadmap v2:
+
+```text
+Hito 1  Especificación v2 y motor de señales multi-factor          en curso (especificación redactada)
+Hito 2  Proveedor intradía y simulación exacta intrabarra           pendiente
+Hito 3  Adaptador de broker en Sandbox (paper) y motor de órdenes   pendiente
+Hito 4  Scheduler diario/intradía, latencia y notificaciones        pendiente
+Hito 5  Paper trading en vivo de 30-60 sesiones                     pendiente
+```
+
+Reglas de continuidad (sección 2 de la especificación v2): con las funciones v2 desactivadas, que es su valor por defecto, el backtest de la v1 debe reproducir exactamente su informe; los valores bloqueados de la v1 no cambian sin un nuevo walk-forward; los módulos v1 se amplían con `Protocol` y parámetros opcionales, sin reescribirlos. Aún no hay código v2: el estado implementado sigue siendo el de la v1 descrito abajo.
+
+## v1 cerrada (2026-10-23)
 
 La v1 (backtesting diario, sin órdenes reales) queda cerrada con estos valores por defecto, definidos en `configs/environments/local.yaml` y usados por `algo-ingest` y `algo-backtest` cuando no se indican argumentos:
 
@@ -1182,13 +1198,17 @@ Completado:
 - Escalado de cartera (posiciones y riesgo) en la rejilla y estudio de escalado por nivel en el walk-forward; señales precalculadas (≈10× más rápido).
 - **Cierre de la v1**: valores por defecto bloqueados (diversified, 5 posiciones, 1 % de riesgo, SL 2×, TP 3×, exposición 20 %) y backtest de confirmación guardado.
 
-Orden inmediato:
+- **Inicio de la v2**: especificación técnica `docs/technical-spec-v2.md` con arquitectura, requisitos y roadmap de cinco hitos.
 
-1. v2: más señales (universo más amplio, umbral anti-gap en la rejilla) y topes de exposición mayores, validados con walk-forward sobre datos posteriores al cierre de la v1 (fuera de muestra real).
-2. Reintentos con backoff para el proveedor real y validación de calidad de datos (saltos de precio, volumen cero).
-3. Decidir proveedor y granularidad intradía antes de implementar su adaptador y la simulación intradía (usando horarios y cierres tempranos del calendario).
+Orden inmediato (Hito 1 de la v2, ver `docs/technical-spec-v2.md`):
 
-No conectar todavía un proveedor externo directamente a la estrategia.
+1. Test de regresión que fije el informe de la v1 con las funciones v2 desactivadas.
+2. Contrato `Signal` / `SignalGenerator` y adaptador de `LongSignalGenerator` (`strategy_id`, `score`).
+3. Indicadores nuevos (volumen relativo, fuerza relativa, RSI, z-score, percentil, correlación) con tests de no look-ahead.
+4. Ingesta de benchmarks, ETFs sectoriales y `^VIX` como serie de referencia.
+5. `CompositeSignalGenerator` con filtros, Short y reversión a la media en el motor; validación con walk-forward frente al baseline v1.
+
+Decisiones v2 propuestas que cierran pendientes de la v1: proveedor intradía Alpaca Market Data (1m / 5m, feed IEX), reintentos con backoff en el pipeline en vivo y modelos `Order` / `Fill`. No conectar el broker a la estrategia antes del Hito 3, y nunca a una cuenta real.
 
 ---
 
@@ -1203,10 +1223,10 @@ Python: 3.13.3
 Sistema operativo: Windows 11
 IDE: VS Code
 Base de datos: MySQL 8.0 mediante Docker Compose
-Estado: v1 cerrada (2026-10-23) con valores por defecto bloqueados: universo diversified, 5 posiciones, 1 % de riesgo, SL 2 × ATR, TP 3 × ATR, exposición 20 %
+Estado: v1 cerrada (2026-10-23) con valores por defecto bloqueados: universo diversified, 5 posiciones, 1 % de riesgo, SL 2 × ATR, TP 3 × ATR, exposición 20 %; v2 en diseño
 Validaciones: pytest, ruff y mypy están en verde
-Siguiente tarea: planificar la v2 (más señales y validación fuera de muestra real)
-Fuente de verdad: docs/project-status.md
+Siguiente tarea: Hito 1 de la v2 (motor de señales multi-factor)
+Fuente de verdad: docs/project-status.md y docs/technical-spec-v2.md
 ```
 
 Antes de continuar, pedir que se confirme la salida de:
@@ -1223,4 +1243,4 @@ No regenerar módulos ya implementados. La v1 está cerrada: no cambiar sus valo
 
 Al abrir el siguiente chat, bastará con indicar:
 
-> Este proyecto continúa desde `docs/project-status.md`. Lee ese estado y no regeneres módulos ya implementados. La v1 está cerrada con valores por defecto bloqueados; el siguiente paso es planificar la v2.
+> Este proyecto continúa desde `docs/project-status.md`. Lee ese estado y `docs/technical-spec-v2.md`, y no regeneres módulos ya implementados. La v1 está cerrada con valores por defecto bloqueados; el siguiente paso es el Hito 1 de la v2.
