@@ -34,6 +34,7 @@ DEFAULT_NOTIFY_CODES = frozenset(
 )
 TELEGRAM_API = "https://api.telegram.org"
 MAX_MESSAGE_LENGTH = 1_900  # Discord admite 2.000 caracteres; Telegram 4.096
+USER_AGENT = "algo-trading/1.0"
 
 JsonPoster = Callable[[str, Mapping[str, object], float], int]
 
@@ -44,7 +45,9 @@ def urllib_post_json(url: str, payload: Mapping[str, object], timeout: float) ->
     request = urllib.request.Request(
         url,
         data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        # Cloudflare (delante de Discord) rechaza con 403 el User-Agent por
+        # defecto de urllib (`Python-urllib/3.x`).
+        headers={"Content-Type": "application/json", "User-Agent": USER_AGENT},
         method="POST",
     )
 

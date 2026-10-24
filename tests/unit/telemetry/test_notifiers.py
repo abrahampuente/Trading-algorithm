@@ -141,3 +141,36 @@ def test_emitter_adds_external_sinks_only_with_secrets() -> None:
         "discord.example",
         "api.telegram.org",
     ]
+
+
+def test_default_poster_sends_a_user_agent(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Sin User-Agent propio, Cloudflare (Discord) responde 403 a urllib."""
+    import urllib.request
+
+    from algo_trading.telemetry import notifiers
+
+    captured: list[urllib.request.Request] = []
+
+    class Response:
+        status = 204
+
+        def __enter__(self) -> "Response":
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+    def fake_urlopen(request: urllib.request.Request, timeout: float) -> Response:
+        captured.append(request)
+        return Response()
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    status = notifiers.urllib_post_json(
+        WEBHOOK.get_secret_value(), {"content": "hola"}, 5.0
+    )
+
+    (request,) = captured
+    assert status == 204
+    assert request.get_header("User-agent") == "algo-trading/1.0"
+    assert request.get_header("Content-type") == "application/json"
