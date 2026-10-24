@@ -481,3 +481,115 @@ def test_live_signals_match_the_backtest_generator_exactly() -> None:
             assert live == signal
 
     database.dispose()
+
+
+# --- Recuperación tras reinicio -------------------------------------------
+
+
+def restarted_source(
+    session: Session,
+    broker: FakeBroker,
+    store: object,
+    sink: MemoryAlertSink | None = None,
+) -> SignalOrderPlanSource:
+    return SignalOrderPlanSource(
+        SignalEngine(session),
+        broker,
+        WeekdayCalendar(),
+        ("AAPL", "MSFT", "XOM", "JPM"),
+        RISK,
+        COSTS,
+        OrderPlanner(gap_threshold_atr=Decimal("0.5")),
+        alerts=AlertEmitter(sink) if sink is not None else None,
+        protections=store,  # type: ignore[arg-type]
+    )
+
+
+def test_pending_protections_are_recovered_after_a_daemon_restart(
+    engine: Engine,
+) -> None:
+    from sqlalchemy.orm import sessionmaker
+
+    from algo_trading.persistence.repositories.live_state_repository import (
+        ProtectionResolution,
+        SqlProtectionStore,
+    )
+
+    broker = FakeBroker()
+    store = SqlProtectionStore(sessionmaker(bind=engine))
+
+    with Session(engine) as session:
+        before = restarted_source(session, broker, store)
+        service = ExecutionService(broker, session)
+        aapl, msft = before.orders_for_session(MONDAY_SESSION)
+
+        for order in (aapl, msft):
+            service.submit(order)
+
+    # Reinicio: proceso nuevo, mismo MySQL.
+    sink = MemoryAlertSink()
+
+    with Session(engine) as session:
+        after = restarted_source(
+            session, broker, SqlProtectionStore(sessionmaker(bind=engine)), sink
+        )
+        service = ExecutionService(broker, session)
+        assert set(after.pending_entries) == {
+            aapl.client_order_id,
+            msft.client_order_id,
+        }
+
+        broker.states[aapl.client_order_id] = broker.state(
+            aapl, "filled", str(aapl.quantity), "110.20"
+        )
+        broker.positions.append(
+            BrokerPosition(
+                symbol="AAPL",
+                quantity=Decimal(aapl.quantity),
+                average_entry_price=Decimal("110.20"),
+            )
+        )
+        service.sync_open_orders()
+        (dispatched,) = after.protect_filled_entries(
+            service, MONDAY_SESSION.session_date
+        )
+
+        assert dispatched.request.order_class is OrderClass.OCO
+        assert after.unprotected_positions(service) == ()
+
+    resolved = store.get(aapl.client_order_id)
+    assert resolved is not None
+    assert resolved.resolution is ProtectionResolution.PROTECTED
+    assert resolved.exit_client_order_id == dispatched.request.client_order_id
+    assert [r.entry_client_order_id for r in store.pending()] == [msft.client_order_id]
+    assert sink.codes() == ["PROTECTIVE_EXIT_SUBMITTED"]
+
+
+def test_entries_never_submitted_are_discarded_after_their_session(
+    engine: Engine,
+) -> None:
+    from algo_trading.execution.pipeline import InMemoryProtectionStore
+    from algo_trading.persistence.repositories.live_state_repository import (
+        ProtectionResolution,
+    )
+
+    broker = FakeBroker()
+    store = InMemoryProtectionStore()
+
+    with Session(engine) as session:
+        source = restarted_source(session, broker, store)
+        service = ExecutionService(broker, session)
+        orders = source.orders_for_session(
+            MONDAY_SESSION
+        )  # envío bloqueado: nunca enviadas
+
+        assert source.protect_filled_entries(service, MONDAY_SESSION.session_date) == ()
+        assert len(source.pending_entries) == 2
+
+        source.protect_filled_entries(service, date(2026, 10, 27))
+
+    assert source.pending_entries == {}
+    assert {
+        store._records[o.client_order_id].resolution
+        for o in orders  # noqa: SLF001
+    } == {ProtectionResolution.NOT_SUBMITTED}

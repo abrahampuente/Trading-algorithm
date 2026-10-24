@@ -40,10 +40,12 @@ from algo_trading.execution.orders import OrderRequest, OrderState
 from algo_trading.persistence.repositories.broker_order_repository import (
     BrokerOrderRecord,
     BrokerOrderRepository,
+    OpenPositionEntry,
     OrderSyncResult,
     UnknownOrderError,
 )
 from algo_trading.portfolio.allocator import PlannedEntry
+from algo_trading.portfolio.exit_levels import calculate_long_exit_levels
 from algo_trading.telemetry.alerts import AlertEmitter, AlertLevel
 
 # Estados de Alpaca en los que el broker ya aceptó la orden (`pending_new`
@@ -225,11 +227,36 @@ class ExecutionService:
         session_date: date,
     ) -> DispatchResult:
         """OCO SL / TP con los niveles recalculados sobre el precio ejecutado."""
-        levels = self._planner.exit_levels_after_fill(planned, fill_price)
+        levels = planned.exit_levels
+        return self.dispatch_protective_exit_from(
+            planned.candidate.symbol,
+            levels.entry_atr,
+            levels.stop_loss_atr_multiple,
+            levels.take_profit_atr_multiple,
+            fill_price,
+            quantity,
+            session_date,
+        )
+
+    def dispatch_protective_exit_from(
+        self,
+        symbol: str,
+        entry_atr: Decimal,
+        stop_loss_atr_multiple: Decimal,
+        take_profit_atr_multiple: Decimal,
+        fill_price: Decimal,
+        quantity: int,
+        session_date: date,
+    ) -> DispatchResult:
+        """OCO desde los datos guardados de la entrada (p. ej. tras un reinicio)."""
+        levels = calculate_long_exit_levels(
+            fill_price,
+            entry_atr,
+            stop_loss_atr_multiple=stop_loss_atr_multiple,
+            take_profit_atr_multiple=take_profit_atr_multiple,
+        )
         return self.submit(
-            self._planner.exit_order(
-                planned.candidate.symbol, quantity, levels, session_date
-            ),
+            self._planner.exit_order(symbol, quantity, levels, session_date),
             allow_when_halted=True,
         )
 
@@ -269,6 +296,10 @@ class ExecutionService:
 
         self._broker.cancel_order(stored.broker_order_id)
         return self.sync(client_order_id)
+
+    def open_position_entries(self) -> dict[str, OpenPositionEntry]:
+        """Inventario local abierto con el instante de su entrada."""
+        return self._repository.open_position_entries()
 
     def open_orders(self) -> tuple[OrderState, ...]:
         """Órdenes no finales guardadas en MySQL (incluidas patas)."""

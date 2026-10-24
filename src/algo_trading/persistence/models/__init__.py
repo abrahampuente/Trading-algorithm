@@ -14,6 +14,11 @@ from algo_trading.persistence.models.corporate_actions import (
     CorporateActionType,
 )
 from algo_trading.persistence.models.data_snapshot import DataSnapshotModel
+from algo_trading.persistence.models.live_state import (
+    DailyOperationalMetricsModel,
+    OperationalAlertModel,
+    PendingProtectionModel,
+)
 from algo_trading.persistence.models.market_data import MarketBarRaw
 
 __all__ = [
@@ -28,4 +33,7 @@ __all__ = [
     "BacktestEquitySnapshotModel",
     "BrokerOrderModel",
     "OrderExecutionModel",
+    "PendingProtectionModel",
+    "OperationalAlertModel",
+    "DailyOperationalMetricsModel",
 ]

@@ -23,13 +23,26 @@ Protección tras la ejecución (`protect_filled_entries`, en cada sincronizació
 intradía): cuando una entrada del plan termina con cantidad ejecutada, envía
 la OCO SL / TP con los niveles recalculados sobre el precio medio ejecutado;
 si termina sin ejecución (gap mayor que el permitido), la descarta. Las
-entradas pendientes viven en memoria: si el daemon se reinicia, las
-posiciones sin OCO se alertan (`UNPROTECTED_POSITIONS`).
+entradas pendientes se guardan en un `ProtectionStore` (MySQL en vivo:
+`pending_protections`), así que un reinicio del daemon las retoma; las
+posiciones del broker sin OCO ni entrada pendiente se alertan
+(`UNPROTECTED_POSITIONS`).
+
+Salidas temporales (`close_expired_positions`, antes de las entradas en
+`pre_open`): como en el backtest, la sesión de entrada cuenta como la primera
+y tras `max_holding_sessions = 20` sesiones la posición se cierra a mercado en
+la apertura de la sesión 21 (`sesiones desde la entrada >= 20`). Antes se
+cancela su OCO, que reserva las acciones. Al plan de entradas de esa misma
+apertura, la posición que sale se le cuenta como cash a su valor de mercado
+(en el backtest el cobro de la salida temporal también precede a las
+entradas). `post_close` anuncia las salidas de la sesión siguiente
+(`TIME_EXIT_SCHEDULED`).
 """
 
 from collections.abc import Callable, Sequence
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, localcontext
+from typing import Protocol
 
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy.orm import Session
@@ -47,6 +60,10 @@ from algo_trading.execution.orders import (
 from algo_trading.execution.service import DispatchResult, ExecutionService
 from algo_trading.persistence.repositories.adjusted_bar_query_repository import (
     AdjustedMarketBarQueryRepository,
+)
+from algo_trading.persistence.repositories.live_state_repository import (
+    ProtectionRecord,
+    ProtectionResolution,
 )
 from algo_trading.portfolio.allocator import (
     EntryCandidate,
@@ -75,6 +92,59 @@ from algo_trading.telemetry.alerts import AlertEmitter, AlertLevel
 DEFAULT_HISTORY_DAYS = 3650
 
 DataRefresher = Callable[[Sequence[str], date], None]
+DEFAULT_MAX_HOLDING_SESSIONS = 20
+
+
+class ProtectionStore(Protocol):
+    def add(self, record: ProtectionRecord) -> None: ...
+
+    def pending(self) -> Sequence[ProtectionRecord]: ...
+
+    def resolve(
+        self,
+        entry_client_order_id: str,
+        resolution: ProtectionResolution,
+        exit_client_order_id: str | None = None,
+    ) -> None: ...
+
+
+class InMemoryProtectionStore:
+    """Almacén sin persistencia (tests y `--check-only`)."""
+
+    def __init__(self) -> None:
+        self._records: dict[str, ProtectionRecord] = {}
+
+    def add(self, record: ProtectionRecord) -> None:
+        self._records.setdefault(record.entry_client_order_id, record)
+
+    def pending(self) -> tuple[ProtectionRecord, ...]:
+        return tuple(r for r in self._records.values() if r.resolution is None)
+
+    def resolve(
+        self,
+        entry_client_order_id: str,
+        resolution: ProtectionResolution,
+        exit_client_order_id: str | None = None,
+    ) -> None:
+        record = self._records[entry_client_order_id]
+        self._records[entry_client_order_id] = record.model_copy(
+            update={
+                "resolution": resolution,
+                "exit_client_order_id": exit_client_order_id,
+            }
+        )
+
+
+class ExpiringPosition(BaseModel):
+    """Posición que alcanza la salida temporal en `exit_session`."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    symbol: str
+    quantity: int
+    entry_session: date
+    exit_session: date
+    sessions_held: int
 
 
 class SignalScan(BaseModel):
@@ -179,7 +249,12 @@ class SignalOrderPlanSource:
         refresh_data: DataRefresher | None = None,
         submit_entries: bool = True,
         clock: Callable[[], datetime] | None = None,
+        protections: ProtectionStore | None = None,
+        max_holding_sessions: int = DEFAULT_MAX_HOLDING_SESSIONS,
     ) -> None:
+        if max_holding_sessions < 1:
+            raise ValueError("max_holding_sessions debe ser al menos 1")
+
         if risk.commission_rate != costs.commission_rate:
             raise ValueError("risk.commission_rate debe coincidir con la del CostModel")
 
@@ -194,13 +269,18 @@ class SignalOrderPlanSource:
         self._refresh = refresh_data
         self._submit_entries = submit_entries
         self._clock = clock or (lambda: datetime.now(UTC))
-        self._pending: dict[str, PlannedEntry] = {}
+        self._protections = protections or InMemoryProtectionStore()
+        self._max_holding = max_holding_sessions
+        self._exiting: dict[date, frozenset[str]] = {}
         self.last_plan: DailyPlan | None = None
 
     @property
-    def pending_entries(self) -> dict[str, PlannedEntry]:
+    def pending_entries(self) -> dict[str, ProtectionRecord]:
         """Entradas enviadas a la espera de ejecución, por `client_order_id`."""
-        return dict(self._pending)
+        return {
+            record.entry_client_order_id: record
+            for record in self._protections.pending()
+        }
 
     def signal_date_for(self, session: TradingSession) -> date:
         """Última sesión cerrada antes de `session` (el cierre `t` de la señal)."""
@@ -214,7 +294,13 @@ class SignalOrderPlanSource:
 
         return previous[-1].session_date
 
-    def build_plan(self, session: TradingSession) -> DailyPlan:
+    def build_plan(
+        self, session: TradingSession, exiting: frozenset[str] = frozenset()
+    ) -> DailyPlan:
+        """
+        `exiting`: símbolos con salida temporal en esta apertura. No cuentan
+        como posición abierta y su valor de mercado se suma al cash.
+        """
         signal_date = self.signal_date_for(session)
 
         if self._refresh is not None:
@@ -222,7 +308,7 @@ class SignalOrderPlanSource:
 
         scan = self._engine.scan(self._symbols, signal_date)
         account = self._broker.get_account()
-        positions = tuple(
+        held = tuple(
             Position(
                 symbol=position.symbol,
                 quantity=int(position.quantity),
@@ -239,8 +325,12 @@ class SignalOrderPlanSource:
             for position in self._broker.get_positions()
             if position.quantity >= 1
         )
+        released = sum(
+            (p.market_value for p in held if p.symbol in exiting), Decimal("0")
+        )
         state = PortfolioState(
-            cash=max(account.cash, Decimal("0")), positions=positions
+            cash=max(account.cash, Decimal("0")) + released,
+            positions=tuple(p for p in held if p.symbol not in exiting),
         )
 
         with localcontext(prec=MONEY_PRECISION, rounding=MONEY_ROUNDING):
@@ -274,16 +364,136 @@ class SignalOrderPlanSource:
         return plan
 
     def orders_for_session(self, session: TradingSession) -> Sequence[OrderRequest]:
-        plan = self.build_plan(session)
+        plan = self.build_plan(
+            session, self._exiting.get(session.session_date, frozenset())
+        )
         self._notify_plan(plan)
 
         if not self._submit_entries:
             return ()
 
         for order, entry in zip(plan.orders, plan.entries, strict=True):
-            self._pending[order.client_order_id] = entry
+            levels = entry.exit_levels
+            self._protections.add(
+                ProtectionRecord(
+                    entry_client_order_id=order.client_order_id,
+                    symbol=order.symbol,
+                    session_date=session.session_date,
+                    entry_atr=levels.entry_atr,
+                    stop_loss_atr_multiple=levels.stop_loss_atr_multiple,
+                    take_profit_atr_multiple=levels.take_profit_atr_multiple,
+                    signal_timestamp=entry.candidate.signal.signal_timestamp,
+                    created_at=self._clock(),
+                )
+            )
 
         return plan.orders
+
+    def expiring_positions(
+        self, service: ExecutionService, session: TradingSession
+    ) -> tuple[ExpiringPosition, ...]:
+        """
+        Posiciones con `sesiones desde la entrada >= max_holding_sessions` en
+        `session` (regla del backtest: salida en la apertura de la sesión 21).
+        La cantidad es la del broker; la fecha de entrada, la del primer fill
+        local de la posición abierta.
+        """
+        entries = service.open_position_entries()
+        broker_quantity = {
+            p.symbol: p.quantity for p in self._broker.get_positions() if p.quantity > 0
+        }
+        expiring: list[ExpiringPosition] = []
+
+        for symbol, entry in entries.items():
+            if symbol not in broker_quantity:
+                continue
+
+            entry_session = entry.opened_at.date()
+            sessions = self._calendar.sessions(entry_session, session.session_date)
+            held = sum(
+                1
+                for s in sessions
+                if entry_session < s.session_date <= session.session_date
+            )
+
+            if held >= self._max_holding:
+                expiring.append(
+                    ExpiringPosition(
+                        symbol=symbol,
+                        quantity=int(broker_quantity[symbol]),
+                        entry_session=entry_session,
+                        exit_session=session.session_date,
+                        sessions_held=held,
+                    )
+                )
+
+        return tuple(expiring)
+
+    def close_expired_positions(
+        self, service: ExecutionService, session: TradingSession
+    ) -> tuple[DispatchResult, ...]:
+        """Cancela la OCO y vende a mercado `OPG` las posiciones vencidas."""
+        dispatched: list[DispatchResult] = []
+        expiring = self.expiring_positions(service, session)
+
+        for position in expiring:
+            for order in service.open_orders():
+                if (
+                    order.symbol == position.symbol
+                    and order.side is OrderSide.SELL
+                    and order.order_class is OrderClass.OCO
+                ):
+                    service.cancel(order.client_order_id)
+                    service.wait_for_status(
+                        order.client_order_id, {"canceled"}, timeout_seconds=15
+                    )
+
+            result = service.dispatch_time_exit(
+                position.symbol, position.quantity, session.session_date
+            )
+            dispatched.append(result)
+            self._alert(
+                AlertLevel.INFO,
+                "TIME_EXIT_SUBMITTED",
+                f"{position.symbol}: salida temporal x{position.quantity} a la "
+                f"apertura ({position.sessions_held} sesiones desde "
+                f"{position.entry_session})",
+                {
+                    "symbol": position.symbol,
+                    "quantity": position.quantity,
+                    "client_order_id": result.request.client_order_id,
+                    "entry_session": position.entry_session.isoformat(),
+                },
+            )
+
+        self._exiting[session.session_date] = frozenset(p.symbol for p in expiring)
+        return tuple(dispatched)
+
+    def announce_time_exits(
+        self, service: ExecutionService, closed_session: TradingSession
+    ) -> tuple[ExpiringPosition, ...]:
+        """Alerta las salidas temporales de la apertura siguiente (`post_close`)."""
+        upcoming = self._calendar.sessions(
+            closed_session.session_date + timedelta(days=1),
+            closed_session.session_date + timedelta(days=10),
+        )
+
+        if not upcoming:
+            return ()
+
+        next_session = upcoming[0]
+        expiring = self.expiring_positions(service, next_session)
+
+        if expiring:
+            self._alert(
+                AlertLevel.INFO,
+                "TIME_EXIT_SCHEDULED",
+                f"Salidas temporales en la apertura de {next_session.session_date}: "
+                + ", ".join(p.symbol for p in expiring),
+                {"symbols": [p.symbol for p in expiring]},
+            )
+
+        return expiring
 
     def protect_filled_entries(
         self, service: ExecutionService, session_date: date
@@ -291,15 +501,26 @@ class SignalOrderPlanSource:
         """OCO SL / TP para las entradas del plan ya cerradas con ejecución."""
         dispatched: list[DispatchResult] = []
 
-        for client_order_id, entry in list(self._pending.items()):
+        for record in self._protections.pending():
+            client_order_id = record.entry_client_order_id
             state = service.order_state(client_order_id)
 
-            if state is None or not state.status.is_terminal:
+            if state is None:
+                # Nunca llegó al broker (p. ej. envío bloqueado): se descarta
+                # al pasar su sesión.
+                if record.session_date < session_date:
+                    self._protections.resolve(
+                        client_order_id, ProtectionResolution.NOT_SUBMITTED
+                    )
                 continue
 
-            del self._pending[client_order_id]
+            if not state.status.is_terminal:
+                continue
 
             if state.filled_quantity < 1 or state.filled_average_price is None:
+                self._protections.resolve(
+                    client_order_id, ProtectionResolution.NOT_FILLED
+                )
                 self._alert(
                     AlertLevel.INFO,
                     "ENTRY_NOT_FILLED",
@@ -308,11 +529,19 @@ class SignalOrderPlanSource:
                 )
                 continue
 
-            result = service.dispatch_protective_exit(
-                entry,
+            result = service.dispatch_protective_exit_from(
+                record.symbol,
+                record.entry_atr,
+                record.stop_loss_atr_multiple,
+                record.take_profit_atr_multiple,
                 state.filled_average_price,
                 int(state.filled_quantity),
                 session_date,
+            )
+            self._protections.resolve(
+                client_order_id,
+                ProtectionResolution.PROTECTED,
+                result.request.client_order_id,
             )
             dispatched.append(result)
             self._alert(
@@ -337,7 +566,7 @@ class SignalOrderPlanSource:
             for order in service.open_orders()
             if order.side is OrderSide.SELL and order.order_class is OrderClass.OCO
         }
-        pending = {entry.candidate.symbol for entry in self._pending.values()}
+        pending = {record.symbol for record in self._protections.pending()}
         return tuple(
             sorted(
                 position.symbol

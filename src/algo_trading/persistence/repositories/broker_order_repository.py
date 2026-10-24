@@ -48,6 +48,14 @@ class BrokerOrderRecord(BaseModel):
     last_synced_at: datetime
 
 
+class OpenPositionEntry(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    symbol: str
+    quantity: Decimal
+    opened_at: datetime
+
+
 class OrderSyncResult(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -246,6 +254,48 @@ class BrokerOrderRepository:
             symbol: quantity.quantize(QUANTUM)
             for symbol, quantity in sorted(positions.items())
             if quantity != 0
+        }
+
+    def open_position_entries(self) -> dict[str, OpenPositionEntry]:
+        """
+        Para cada símbolo con inventario local positivo, la cantidad y el
+        instante de la primera compra desde que el inventario estuvo a cero
+        por última vez (la entrada de la posición abierta).
+        """
+        rows = self._session.execute(
+            select(
+                BrokerOrderModel.symbol,
+                BrokerOrderModel.side,
+                OrderExecutionModel.quantity,
+                OrderExecutionModel.executed_at,
+            )
+            .join(BrokerOrderModel, BrokerOrderModel.id == OrderExecutionModel.order_id)
+            .order_by(OrderExecutionModel.executed_at, OrderExecutionModel.id)
+        ).all()
+        quantity: dict[str, Decimal] = {}
+        opened_at: dict[str, datetime] = {}
+
+        for symbol, side, executed, executed_at in rows:
+            current = quantity.get(symbol, Decimal("0"))
+
+            if side == OrderSide.BUY.value:
+                if current <= 0:
+                    opened_at[symbol] = _from_db(executed_at)
+
+                current += executed
+            else:
+                current -= executed
+
+            quantity[symbol] = current
+
+        return {
+            symbol: OpenPositionEntry(
+                symbol=symbol,
+                quantity=held.quantize(QUANTUM),
+                opened_at=opened_at[symbol],
+            )
+            for symbol, held in sorted(quantity.items())
+            if held > 0
         }
 
     def get_executions(self, client_order_id: str) -> tuple[OrderExecution, ...]:

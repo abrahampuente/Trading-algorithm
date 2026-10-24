@@ -29,6 +29,12 @@ OCO SL / TP. `--check-only` muestra el plan que se generaría para la próxima
 sesión con los datos ya guardados, sin enviar nada; `--plan-only` lo genera y
 notifica cada día sin enviar órdenes.
 
+Estado persistente en MySQL: entradas a la espera de su OCO
+(`pending_protections`, se retoman tras reiniciar), alertas
+(`operational_alerts`) y métricas diarias (`daily_operational_metrics`).
+Las posiciones vencidas (20 sesiones) se venden a mercado en la apertura de
+la sesión 21, antes de las entradas.
+
 Notificaciones: alertas en el log (JSON) y, si están en `.env`, Discord
 (`DISCORD_WEBHOOK_URL`) y Telegram (`TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`).
 
@@ -84,6 +90,11 @@ from algo_trading.execution.pipeline import (
     SignalOrderPlanSource,
 )
 from algo_trading.execution.service import ExecutionService, ReconciliationReport
+from algo_trading.persistence.repositories.live_state_repository import (
+    DatabaseAlertSink,
+    SqlProtectionStore,
+    TelemetryStore,
+)
 from algo_trading.persistence.repositories.market_bar_query_repository import (
     RawMarketBarQueryRepository,
 )
@@ -343,8 +354,12 @@ def build_alert_emitter(
     settings: ApplicationSettings,
     now: Callable[[], datetime],
     post: JsonPoster | None = None,
+    session_factory: Callable[[], Session] | None = None,
 ) -> AlertEmitter:
-    """Log JSON siempre; Discord y Telegram si sus secretos están en el entorno."""
+    """
+    Log JSON siempre; MySQL (`operational_alerts`) con `session_factory`;
+    Discord y Telegram si sus secretos están en el entorno.
+    """
     notifications = settings.notifications
     alert_filter = AlertFilter(
         AlertLevel(notifications.min_level),
@@ -353,6 +368,10 @@ def build_alert_emitter(
         else DEFAULT_NOTIFY_CODES,
     )
     sinks: list[AlertSink] = [LogAlertSink()]
+
+    if session_factory is not None:
+        sinks.append(DatabaseAlertSink(session_factory))
+
     webhook = settings.discord_webhook_url
 
     if webhook is not None and webhook.get_secret_value():
@@ -420,6 +439,7 @@ def build_plan_source(
         refresh_data=refresh_data,
         submit_entries=not arguments.plan_only,
         clock=now,
+        protections=SqlProtectionStore(session_factory, now),
     )
 
 
@@ -462,7 +482,8 @@ def main(
 
     settings = deps.settings or ApplicationSettings.from_yaml()
     now = deps.now or (lambda: datetime.now(UTC))
-    alerts = build_alert_emitter(settings, now)
+    session_factory = deps.session_factory or _default_session_factory()
+    alerts = build_alert_emitter(settings, now, session_factory=session_factory)
 
     try:
         broker = (deps.broker_factory or build_alpaca_paper_broker)(settings)
@@ -470,7 +491,6 @@ def main(
         print(f"Arranque cancelado (guardia de paper trading): {error}")
         return EXIT_PREFLIGHT_FAILED
 
-    session_factory = deps.session_factory or _default_session_factory()
     session = session_factory()
 
     try:
@@ -525,6 +545,7 @@ def main(
                 (lambda: broker.request_log) if hasattr(broker, "request_log") else None
             ),
             protection=plans,
+            metrics_store=TelemetryStore(session_factory),
         )
         daemon = ExecutionDaemon(market, jobs, alerts=alerts, now=now)
 

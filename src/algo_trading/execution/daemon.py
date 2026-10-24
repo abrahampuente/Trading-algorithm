@@ -418,7 +418,7 @@ class OrderPlanSource(Protocol):
 
 
 class ProtectionHook(Protocol):
-    """Salidas de protección de las entradas ejecutadas (ver `pipeline`)."""
+    """Salidas de protección y temporales de las posiciones (ver `pipeline`)."""
 
     def protect_filled_entries(
         self, service: ExecutionService, session_date: date
@@ -426,19 +426,40 @@ class ProtectionHook(Protocol):
 
     def unprotected_positions(self, service: ExecutionService) -> Sequence[str]: ...
 
+    def close_expired_positions(
+        self, service: ExecutionService, session: TradingSession
+    ) -> Sequence[Any]: ...
+
+    def announce_time_exits(
+        self, service: ExecutionService, closed_session: TradingSession
+    ) -> Sequence[Any]: ...
+
+
+class MetricsRecorder(Protocol):
+    def record_daily_metrics(
+        self,
+        session_date: date,
+        metrics: OperationalMetrics,
+        reconciliation_consistent: bool | None,
+        extra: dict[str, Any] | None = None,
+    ) -> None: ...
+
 
 class ExecutionJobs:
     """
     Tareas del daemon sobre `ExecutionService`:
 
-    - `pre_open`: envía las órdenes del plan de la sesión (no envía nada si la
-      reconciliación bloqueó el envío; lo alerta).
+    - `pre_open`: con `protection`, primero las salidas temporales de las
+      posiciones vencidas (sesión 21); después las entradas del plan de la
+      sesión (no envía entradas si la reconciliación bloqueó el envío; lo
+      alerta).
     - `intraday`: sincroniza órdenes y fills abiertos, alerta cada ejecución
       (`ORDER_FILLED`) y, con `protection`, envía las OCO SL / TP de las
       entradas ya ejecutadas.
-    - `post_close`: reconcilia, alerta posiciones sin OCO de protección y
-      publica las métricas operativas del día (slippage, latencia acumulada
-      de la API y tasa de ejecución).
+    - `post_close`: reconcilia, alerta posiciones sin OCO de protección,
+      anuncia las salidas temporales de la sesión siguiente y publica (y con
+      `metrics_store` guarda) las métricas operativas del día (slippage,
+      latencia acumulada de la API y tasa de ejecución).
     """
 
     def __init__(
@@ -449,10 +470,12 @@ class ExecutionJobs:
         latency: LatencyTracker | None = None,
         request_log: Callable[[], Sequence[Any]] | None = None,
         protection: ProtectionHook | None = None,
+        metrics_store: MetricsRecorder | None = None,
     ) -> None:
         self._service = service
         self._plans = plans
         self._protection = protection
+        self._metrics_store = metrics_store
         self._alerts = alerts
         self._latency = latency or LatencyTracker()
         self._request_log = request_log
@@ -460,6 +483,9 @@ class ExecutionJobs:
         self.last_metrics: OperationalMetrics | None = None
 
     def pre_open(self, session: TradingSession) -> None:
+        if self._protection is not None:
+            self._protection.close_expired_positions(self._service, session)
+
         orders = self._plans.orders_for_session(session)
 
         for request in orders:
@@ -517,11 +543,22 @@ class ExecutionJobs:
                     {"symbols": list(unprotected)},
                 )
 
+            self._protection.announce_time_exits(self._service, session)
+
         self._refresh_latency()
         self.last_metrics = operational_metrics(
             self._service.order_records(), self._latency.timings
         )
         metrics = self.last_metrics
+
+        if self._metrics_store is not None:
+            self._metrics_store.record_daily_metrics(
+                session.session_date,
+                metrics,
+                self.last_reconciliation.is_consistent,
+                {"reconciliation": self.last_reconciliation.model_dump(mode="json")},
+            )
+
         self._alerts.emit(
             AlertLevel.INFO,
             "DAILY_SUMMARY",

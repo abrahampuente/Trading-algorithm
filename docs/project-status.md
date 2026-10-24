@@ -341,7 +341,32 @@ Validación real (2026-10-23 22:19 UTC):
 - `algo-ingest --universe diversified --end 2026-10-23`: barra del viernes ingerida en los 15 símbolos (1712 sesiones). El test de regresión v1 usa el periodo fijo hasta 2026-10-22 y no cambia.
 - `algo-live --check-only`: datos al día, reconciliación OK, plan para 2026-10-26 con 0 órdenes (ninguna señal v1 en el cierre del viernes). Comprobación del motor sobre datos reales: 11 señales en las 38 sesiones del 2026-09-01 al 2026-10-23 (la última, PG el 2026-10-22).
 
-Pendiente en el Hito 4: salidas temporales (20 sesiones) en el plan diario; persistir las entradas pendientes de protección, alertas y métricas; configurar Discord o Telegram; primera sesión completa en paper con el mercado abierto.
+Salidas temporales (`SignalOrderPlanSource.close_expired_positions`, al inicio de `pre_open`):
+
+- Misma regla que el backtest: la sesión de entrada es la primera y la posición se cierra en la apertura de la sesión 21 (`sesiones desde la entrada >= 20`, contadas con el calendario: festivos y fines de semana no cuentan).
+- Fecha de entrada = primer fill de compra desde que el inventario local estuvo a cero (`BrokerOrderRepository.open_position_entries`); cantidad = la del broker. Las posiciones del broker sin entrada local no se tocan (las detecta la reconciliación).
+- Se cancela la OCO de la posición (reserva las acciones) y se envía la venta a mercado `OPG` (`TIME_EXIT_SUBMITTED`), también con el envío bloqueado; reenviar en la misma apertura no duplica (`client_order_id` determinista).
+- El plan de entradas de esa apertura no cuenta la posición que sale y suma su valor de mercado al cash, como el backtest (la salida temporal se cobra antes de las entradas).
+- `post_close` anuncia las salidas de la sesión siguiente (`TIME_EXIT_SCHEDULED`).
+
+Estado persistente (migración `c2d3e4f5a6b7`, timestamps `DATETIME(6)`):
+
+```text
+pending_protections        entradas a la espera de su OCO: ATR congelado (Numeric 28,12), multiplicadores SL / TP,
+                           sesión, resolución (PROTECTED / NOT_FILLED / NOT_SUBMITTED) y OCO enviada
+operational_alerts         una fila por alerta: nivel, código, mensaje, detalles (JSON)
+daily_operational_metrics  una fila por sesión (se reemplaza): slippage, latencia de la API, órdenes, fill_rate,
+                           reconciliación coherente y el detalle completo en JSON
+```
+
+- `SqlProtectionStore` sustituye al diccionario en memoria: tras un reinicio del daemon, las entradas pendientes se retoman y su OCO se envía al ejecutarse; las que nunca llegaron al broker se descartan al pasar su sesión (`NOT_SUBMITTED`).
+- `DatabaseAlertSink` guarda cada alerta (un fallo de MySQL sólo se registra en el log) y `TelemetryStore` guarda las métricas diarias en `post_close` y lee alertas y métricas.
+- `algo-live` usa los tres; cada operación en su propia transacción corta, independiente de la del `ExecutionService`.
+- Tests: salidas temporales (19 / 20 / 21 sesiones, festivos, cancelación de la OCO, envío con bloqueo, idempotencia, cash liberado para el plan, anuncio), recuperación tras reinicio, descarte de entradas no enviadas, almacenes en SQLite e integración en MySQL.
+
+Ejecución real (2026-10-24 02:20 UTC, `algo-live --once`): migración `c2d3e4f5a6b7`, datos al día (2026-10-23), reconciliación OK; `post_close` guardó `RECONCILIATION_OK` y `DAILY_SUMMARY` en `operational_alerts` (con microsegundos) y la fila de 2026-10-23 en `daily_operational_metrics` (7 peticiones, p50 470 ms, p95 752 ms, coherente); 0 protecciones pendientes.
+
+Pendiente en el Hito 4: configurar Discord o Telegram; primera sesión completa en paper con el mercado abierto (entrada `OPG` → fill → OCO → salida).
 
 
 ## v1 cerrada (2026-10-23)
@@ -666,6 +691,7 @@ market_bars_adjusted
 data_snapshots
 backtest_runs / backtest_trades / backtest_equity_snapshots
 broker_orders / order_executions   (v2, Hito 3)
+pending_protections / operational_alerts / daily_operational_metrics   (v2, Hito 4)
 ```
 
 Restricciones relevantes:
