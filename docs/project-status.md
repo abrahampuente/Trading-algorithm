@@ -1,18 +1,38 @@
 # Estado del proyecto — Algo Trading
 
-## Estado actual: v2 en diseño (iniciado 2026-10-23)
+## Estado actual: v2 lista para paper trading (2026-10-24)
 
-La especificación técnica de la v2 está en `docs/technical-spec-v2.md`. Cubre cuatro ejes: señales multi-factor (fuerza relativa sectorial, filtros de volumen y régimen, Short y reversión a la media), precisión intradía (resolución SL/TP con barras de 1m, correlación de cartera y costes dinámicos), paper trading en una cuenta demo de broker (Alpaca Paper, con órdenes, fills, latencia y slippage real) y telemetría con notificaciones.
+`algo-live` está listo para operar en Alpaca Paper desde la apertura del 2026-10-26: verificaciones de arranque, plan diario desde las señales v1 (entradas `OPG` con escudo anti-gap), OCO de protección tras cada fill, salidas temporales a la sesión 21, reconciliación con bloqueo, telemetría y estado persistente en MySQL. Nunca opera con dinero real (guardia de paper).
+
+La especificación técnica de la v2 está en `docs/technical-spec-v2.md` (local, no versionada). Cubre cuatro ejes: señales multi-factor, precisión intradía, paper trading en una cuenta demo de broker y telemetría con notificaciones.
 
 Roadmap v2:
 
 ```text
-Hito 1  Especificación v2 y motor de señales multi-factor          parcial (filtros de régimen; Short pendiente)
-Hito 2  Proveedor intradía y simulación exacta intrabarra           validado con Alpaca real
+Hito 1  Especificación v2 y motor de señales multi-factor          parcial: filtros de régimen (sector, VIX, ATR, tendencia)
+                                                                    y walk-forward hechos; Short, reversión a la media y
+                                                                    confirmación por volumen sin implementar
+Hito 2  Proveedor intradía y simulación exacta intrabarra           cerrado (validado con Alpaca real); pendientes menores:
+                                                                    persistir minutos, correlación de cartera, costes dinámicos
 Hito 3  Adaptador de broker en Sandbox (paper) y motor de órdenes   cerrado (pipeline validado en frío)
-Hito 4  Scheduler diario/intradía, latencia y notificaciones        en curso
-Hito 5  Paper trading en vivo de 30-60 sesiones                     pendiente
+Hito 4  Scheduler diario/intradía, latencia y notificaciones        cerrado: daemon, algo-live, pipeline señales → órdenes,
+                                                                    salidas, reconciliación, telemetría y estado en MySQL
+Hito 5  Paper trading en vivo de 30-60 sesiones                     siguiente paso (primera sesión: 2026-10-26)
 ```
+
+Cierre de la sesión del 2026-10-23 / 24:
+
+- Validaciones: `pytest` (incluido `test_v1_regression.py` con el checksum exacto `1e500e90…eed5c`), `ruff check`, `ruff format --check`, `mypy src` y `alembic check` en verde; MySQL en la migración `c2d3e4f5a6b7`.
+- `algo-live --check-only` (2026-10-24 02:3x UTC): cuenta paper `PA…` activa, datos al día (2026-10-23), reconciliación OK, plan para el 2026-10-26 con 0 órdenes (sin señales v1 en el cierre del viernes).
+- Orden de verificación visual abierta en Alpaca Paper: compra limitada `day` de 1 SPY a 300 USD (`client_order_id algo-visible-test-SPY-20261024T022706`, `broker_order_id 6d844787-417d-43f7-8394-844738c5bfea`), guardada también en `broker_orders` para que la reconciliación la reconozca. No se puede ejecutar (último cierre 759,97) y Alpaca la expira al cierre del 2026-10-26; para cancelarla antes: `python scripts/test_visible_order.py --cancel`.
+- Notificaciones: `DISCORD_WEBHOOK_URL`, `TELEGRAM_BOT_TOKEN` y `TELEGRAM_CHAT_ID` declaradas vacías en `.env` y `.env.example` (vacío = desactivado). Rellenarlas antes de la apertura para recibir el plan, los fills, las OCO y los bloqueos; mientras tanto las alertas quedan en el log y en `operational_alerts`.
+
+Antes de la primera sesión (2026-10-26, apertura 13:30 UTC):
+
+1. Opcional: rellenar Discord o Telegram en `.env`.
+2. `algo-live --check-only` para revisar estado y plan.
+3. Arrancar `algo-live` antes de las 13:15 UTC (ventana `pre_open`); si arranca después, el envío `OPG` de ese día se pierde (`JOB_MISSED`) y sólo sincroniza.
+4. Lo que aún no se ha probado con el mercado abierto: el ciclo completo entrada `OPG` → fill → OCO → salida y el modo continuo del daemon contra los servicios reales.
 
 Reglas de continuidad (sección 2 de la especificación v2): con las funciones v2 desactivadas, que es su valor por defecto, el backtest de la v1 debe reproducir exactamente su informe; los valores bloqueados de la v1 no cambian sin un nuevo walk-forward; los módulos v1 se amplían con `Protocol` y parámetros opcionales, sin reescribirlos.
 
@@ -266,7 +286,7 @@ Marcas (UTC)                     envío local 21:40:55.598106 · POST ≈ 21:40:
 
 Cierre del Hito 3 (2026-10-23): pipeline completo broker + planificador + repositorio (`ExecutionService`) validado contra Alpaca Paper en frío (mercado cerrado): POST 411 ms, cancelación 392 ms, marcas `DATETIME(6)` en MySQL. Pasan al Hito 4: medir envío → fill con el mercado abierto, reconciliación de posiciones y ciclo entrada `OPG` → fill → OCO dentro del daemon.
 
-### Hito 4 (en curso): daemon de ejecución, reconciliación y telemetría
+### Hito 4 (cerrado): daemon de ejecución, reconciliación y telemetría
 
 Daemon (`execution/daemon.py`), probado con calendario y reloj simulados; todavía sin CLI ni ejecución en vivo:
 
@@ -366,7 +386,9 @@ daily_operational_metrics  una fila por sesión (se reemplaza): slippage, latenc
 
 Ejecución real (2026-10-24 02:20 UTC, `algo-live --once`): migración `c2d3e4f5a6b7`, datos al día (2026-10-23), reconciliación OK; `post_close` guardó `RECONCILIATION_OK` y `DAILY_SUMMARY` en `operational_alerts` (con microsegundos) y la fila de 2026-10-23 en `daily_operational_metrics` (7 peticiones, p50 470 ms, p95 752 ms, coherente); 0 protecciones pendientes.
 
-Pendiente en el Hito 4: configurar Discord o Telegram; primera sesión completa en paper con el mercado abierto (entrada `OPG` → fill → OCO → salida).
+Hito 4 cerrado. Quedan para el Hito 5: configurar Discord o Telegram y la primera sesión completa en paper con el mercado abierto (entrada `OPG` → fill → OCO → salida).
+
+Script auxiliar `scripts/test_visible_order.py`: orden de verificación visual en Alpaca Paper (compra limitada muy por debajo del mercado, por defecto 1 SPY a 300 USD; se niega si el límite está a menos de un 10 % del último cierre), `--status` y `--cancel [CLIENT_ORDER_ID]`. Pasa por `ExecutionService` para quedar en `broker_orders`.
 
 
 ## v1 cerrada (2026-10-23)
@@ -1579,9 +1601,9 @@ Python: 3.13.3
 Sistema operativo: Windows 11
 IDE: VS Code
 Base de datos: MySQL 8.0 mediante Docker Compose
-Estado: v1 cerrada (2026-10-23) con valores por defecto bloqueados: universo diversified, 5 posiciones, 1 % de riesgo, SL 2 × ATR, TP 3 × ATR, exposición 20 %; v2 en diseño
+Estado: v1 cerrada (2026-10-23) con valores por defecto bloqueados: universo diversified, 5 posiciones, 1 % de riesgo, SL 2 × ATR, TP 3 × ATR, exposición 20 %; v2 Hitos 2-4 cerrados, algo-live listo para paper trading
 Validaciones: pytest, ruff y mypy están en verde
-Siguiente tarea: Hito 1 de la v2 (motor de señales multi-factor)
+Siguiente tarea: Hito 5 de la v2 (paper trading en vivo con algo-live desde 2026-10-26)
 Fuente de verdad: docs/project-status.md y docs/technical-spec-v2.md
 ```
 
@@ -1599,4 +1621,4 @@ No regenerar módulos ya implementados. La v1 está cerrada: no cambiar sus valo
 
 Al abrir el siguiente chat, bastará con indicar:
 
-> Este proyecto continúa desde `docs/project-status.md`. Lee ese estado y `docs/technical-spec-v2.md`, y no regeneres módulos ya implementados. La v1 está cerrada con valores por defecto bloqueados; el siguiente paso es el Hito 1 de la v2.
+> Este proyecto continúa desde `docs/project-status.md`. Lee ese estado y `docs/technical-spec-v2.md`, y no regeneres módulos ya implementados. La v1 está cerrada con valores por defecto bloqueados; la v2 tiene los Hitos 2-4 cerrados y `algo-live` listo; el siguiente paso es el Hito 5 (paper trading en vivo).
