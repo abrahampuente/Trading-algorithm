@@ -149,6 +149,19 @@ class BrokerSettings(BaseModel):
     gap_threshold_atr: Decimal = Field(default=Decimal("0.5"), ge=0)
 
 
+class NotificationSettings(BaseModel):
+    """
+    Filtro de notificaciones externas (Discord / Telegram). Las URL y tokens
+    sólo se leen del entorno: `DISCORD_WEBHOOK_URL`, `TELEGRAM_BOT_TOKEN` y
+    `TELEGRAM_CHAT_ID`. `codes = None` usa la lista por defecto de
+    `telemetry.notifiers`.
+    """
+
+    min_level: Literal["INFO", "WARNING", "CRITICAL"] = "WARNING"
+    codes: tuple[str, ...] | None = None
+    timeout_seconds: float = Field(default=5.0, gt=0)
+
+
 class DatabaseSettings(BaseModel):
     host: str
     port: int = Field(gt=0, le=65535)
@@ -187,6 +200,7 @@ class ApplicationSettings(BaseSettings):
     signals: SignalSettings = Field(default_factory=SignalSettings)
     intraday: IntradaySettings = Field(default_factory=IntradaySettings)
     broker: BrokerSettings = Field(default_factory=BrokerSettings)
+    notifications: NotificationSettings = Field(default_factory=NotificationSettings)
 
     @model_validator(mode="after")
     def validate_default_universe(self) -> "ApplicationSettings":
@@ -209,6 +223,9 @@ class ApplicationSettings(BaseSettings):
     )
     # Texto, no bool: PaperTradingGuard sólo acepta el valor exacto "true".
     alpaca_paper: str | None = None
+    discord_webhook_url: SecretStr | None = None
+    telegram_bot_token: SecretStr | None = None
+    telegram_chat_id: str | None = None
 
     @classmethod
     def from_yaml(

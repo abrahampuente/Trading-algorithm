@@ -326,7 +326,18 @@ def test_execution_jobs_cycle(engine: Engine) -> None:
     jobs.intraday(SESSION)
     jobs.post_close(SESSION)
 
-    assert sink.codes() == ["PRE_OPEN_SUBMITTED", "RECONCILIATION_OK", "DAILY_SUMMARY"]
+    assert sink.codes() == [
+        "PRE_OPEN_SUBMITTED",
+        "ORDER_FILLED",
+        "RECONCILIATION_OK",
+        "DAILY_SUMMARY",
+    ]
+    filled = sink.alerts[1].details
+    assert (filled["quantity"], filled["price"], filled["status"]) == (
+        "10.00000000",
+        "100.20000000",
+        "FILLED",
+    )
     assert jobs.last_reconciliation is not None
     assert jobs.last_reconciliation.is_consistent
     metrics = jobs.last_metrics

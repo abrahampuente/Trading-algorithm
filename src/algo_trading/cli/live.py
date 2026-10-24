@@ -6,6 +6,7 @@ Uso:
     algo-live --check-only    # verificaciones y estado del mercado, sin bucle
     algo-live --once          # verificaciones y un único ciclo del daemon
     algo-live                 # daemon continuo hasta Ctrl+C / SIGTERM
+    algo-live --plan-only     # genera y notifica el plan diario sin enviar órdenes
     algo-live --universe initial --log-level DEBUG
 
 Verificaciones al arrancar (cualquier fallo termina con código 1 sin enviar
@@ -20,8 +21,16 @@ Verificaciones al arrancar (cualquier fallo termina con código 1 sin enviar
    órdenes y termina con código 2 (`--check-only` / `--once`); en modo
    continuo el daemon arranca bloqueado y sólo sincroniza.
 
-Las órdenes del plan diario aún no se generan desde las señales: el daemon
-sincroniza, reconcilia y publica métricas, pero `pre_open` no envía órdenes.
+Plan diario (`execution/pipeline.py`): antes de cada apertura, el daemon
+ingiere el cierre anterior (salvo `--skip-ingest`), genera las señales v1 del
+universo, dimensiona con el cash y las posiciones del broker y envía las
+compras `OPG` con el escudo anti-gap. Cuando una entrada se ejecuta, envía su
+OCO SL / TP. `--check-only` muestra el plan que se generaría para la próxima
+sesión con los datos ya guardados, sin enviar nada; `--plan-only` lo genera y
+notifica cada día sin enviar órdenes.
+
+Notificaciones: alertas en el log (JSON) y, si están en `.env`, Discord
+(`DISCORD_WEBHOOK_URL`) y Telegram (`TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`).
 
 Ctrl+C (SIGINT), SIGTERM y SIGBREAK (Windows) piden una parada segura: la
 tarea en curso termina y el daemon se detiene sin iniciar otras.
@@ -42,11 +51,14 @@ from pydantic import BaseModel, ConfigDict
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from algo_trading.config.settings import PROJECT_ROOT, ApplicationSettings
+from algo_trading.config.settings import (
+    DEFAULT_COST_PROFILE,
+    PROJECT_ROOT,
+    ApplicationSettings,
+)
 from algo_trading.data.market_calendar import (
     DEFAULT_EXCHANGE,
     TradingCalendar,
-    TradingSession,
 )
 from algo_trading.data.providers.dto import Timeframe
 from algo_trading.data.providers.yfinance import YFINANCE_SOURCE
@@ -56,6 +68,7 @@ from algo_trading.execution.alpaca_broker import (
     build_alpaca_paper_broker,
 )
 from algo_trading.execution.broker import AccountSnapshot, BrokerAdapter
+from algo_trading.execution.costs import CostModel
 from algo_trading.execution.daemon import (
     DaemonState,
     ExecutionDaemon,
@@ -63,12 +76,31 @@ from algo_trading.execution.daemon import (
     MarketClock,
     MarketStatus,
 )
-from algo_trading.execution.orders import OrderRequest
+from algo_trading.execution.order_planner import OrderPlanner
+from algo_trading.execution.pipeline import (
+    DailyPlan,
+    DataRefresher,
+    SignalEngine,
+    SignalOrderPlanSource,
+)
 from algo_trading.execution.service import ExecutionService, ReconciliationReport
 from algo_trading.persistence.repositories.market_bar_query_repository import (
     RawMarketBarQueryRepository,
 )
-from algo_trading.telemetry.alerts import AlertEmitter, LogAlertSink
+from algo_trading.portfolio.position_sizing import RiskParameters
+from algo_trading.telemetry.alerts import (
+    AlertEmitter,
+    AlertLevel,
+    AlertSink,
+    LogAlertSink,
+)
+from algo_trading.telemetry.notifiers import (
+    DEFAULT_NOTIFY_CODES,
+    AlertFilter,
+    DiscordWebhookSink,
+    JsonPoster,
+    TelegramSink,
+)
 
 EXIT_OK = 0
 EXIT_PREFLIGHT_FAILED = 1
@@ -92,6 +124,7 @@ class Dependencies(BaseModel):
     calendar_factory: Callable[[str], TradingCalendar] | None = None
     expected_revision: Callable[[], str | None] | None = None
     now: Callable[[], datetime] | None = None
+    refresh_data: DataRefresher | None = None
 
 
 class DataFreshness(BaseModel):
@@ -118,17 +151,6 @@ class PreflightReport(BaseModel):
     reconciliation: ReconciliationReport
 
 
-class NoOrderPlan:
-    """Plan vacío: la generación de órdenes desde señales aún no está conectada."""
-
-    def orders_for_session(self, session: TradingSession) -> Sequence[OrderRequest]:
-        logging.getLogger(__name__).info(
-            "Sin plan de órdenes para %s: generación desde señales pendiente",
-            session.session_date,
-        )
-        return ()
-
-
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="algo-live",
@@ -151,6 +173,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--once",
         action="store_true",
         help="Verificaciones y un único ciclo del daemon.",
+    )
+    parser.add_argument(
+        "--plan-only",
+        action="store_true",
+        help="Genera y notifica el plan diario sin enviar órdenes de entrada.",
+    )
+    parser.add_argument(
+        "--skip-ingest",
+        action="store_true",
+        help="No ingiere el cierre anterior antes de generar el plan.",
     )
     parser.add_argument(
         "--log-level",
@@ -307,6 +339,119 @@ def format_preflight(report: PreflightReport) -> str:
     return "\n".join(lines)
 
 
+def build_alert_emitter(
+    settings: ApplicationSettings,
+    now: Callable[[], datetime],
+    post: JsonPoster | None = None,
+) -> AlertEmitter:
+    """Log JSON siempre; Discord y Telegram si sus secretos están en el entorno."""
+    notifications = settings.notifications
+    alert_filter = AlertFilter(
+        AlertLevel(notifications.min_level),
+        notifications.codes
+        if notifications.codes is not None
+        else DEFAULT_NOTIFY_CODES,
+    )
+    sinks: list[AlertSink] = [LogAlertSink()]
+    webhook = settings.discord_webhook_url
+
+    if webhook is not None and webhook.get_secret_value():
+        sinks.append(
+            DiscordWebhookSink(
+                webhook, alert_filter, post, notifications.timeout_seconds
+            )
+        )
+
+    token = settings.telegram_bot_token
+
+    if token is not None and token.get_secret_value() and settings.telegram_chat_id:
+        sinks.append(
+            TelegramSink(
+                token,
+                settings.telegram_chat_id,
+                alert_filter,
+                post,
+                notifications.timeout_seconds,
+            )
+        )
+
+    return AlertEmitter(*sinks, clock=now)
+
+
+def build_plan_source(
+    arguments: argparse.Namespace,
+    settings: ApplicationSettings,
+    broker: BrokerAdapter,
+    session: Session,
+    session_factory: Callable[[], Session],
+    calendar: TradingCalendar,
+    symbols: Sequence[str],
+    alerts: AlertEmitter,
+    now: Callable[[], datetime],
+    refresh_data: DataRefresher | None = None,
+) -> SignalOrderPlanSource:
+    """Plan diario con los valores bloqueados de la v1 y el perfil de costes base."""
+    strategy = settings.strategy
+    profile = settings.cost_profile(DEFAULT_COST_PROFILE)
+    costs = CostModel(
+        commission_rate=profile.commission_rate, slippage_rate=profile.slippage_rate
+    )
+    risk = RiskParameters(
+        max_positions=settings.max_positions,
+        risk_per_trade=strategy.risk_per_trade,
+        max_position_exposure=strategy.max_position_exposure,
+        stop_loss_atr_multiple=strategy.stop_loss_atr_multiple,
+        take_profit_atr_multiple=strategy.take_profit_atr_multiple,
+        commission_rate=costs.commission_rate,
+    )
+
+    if refresh_data is None and not (arguments.skip_ingest or arguments.check_only):
+        refresh_data = _yahoo_refresher(session_factory)
+
+    return SignalOrderPlanSource(
+        SignalEngine(session),
+        broker,
+        calendar,
+        symbols,
+        risk,
+        costs,
+        OrderPlanner(gap_threshold_atr=settings.broker.gap_threshold_atr),
+        alerts=alerts,
+        refresh_data=refresh_data,
+        submit_entries=not arguments.plan_only,
+        clock=now,
+    )
+
+
+def format_plan(plan: DailyPlan) -> str:
+    lines = [
+        f"Plan para {plan.session_date} (señales del cierre {plan.signal_date}): "
+        f"{len(plan.orders)} órdenes OPG de {len(plan.signals)} señales; equity "
+        f"{plan.equity:,.2f}, posiciones abiertas "
+        f"{', '.join(plan.open_positions) or 'ninguna'}",
+    ]
+    lines.extend(
+        f"  COMPRA {order.symbol} x{order.quantity} límite {order.limit_price} "
+        f"(cierre {order.theoretical_price})"
+        for order in plan.orders
+    )
+    lines.extend(
+        f"  rechazada {item.candidate.symbol}: {item.reason.value}"
+        for item in plan.rejected
+    )
+
+    if plan.stale_symbols:
+        lines.append(
+            "  sin datos del cierre (no generan señal): "
+            + ", ".join(
+                f"{symbol} {day or 'sin barras'}"
+                for symbol, day in sorted(plan.stale_symbols.items())
+            )
+        )
+
+    return "\n".join(lines)
+
+
 def main(
     argv: Sequence[str] | None = None, dependencies: Dependencies | None = None
 ) -> int:
@@ -317,7 +462,7 @@ def main(
 
     settings = deps.settings or ApplicationSettings.from_yaml()
     now = deps.now or (lambda: datetime.now(UTC))
-    alerts = AlertEmitter(LogAlertSink(), clock=now)
+    alerts = build_alert_emitter(settings, now)
 
     try:
         broker = (deps.broker_factory or build_alpaca_paper_broker)(settings)
@@ -325,7 +470,8 @@ def main(
         print(f"Arranque cancelado (guardia de paper trading): {error}")
         return EXIT_PREFLIGHT_FAILED
 
-    session = (deps.session_factory or _default_session_factory())()
+    session_factory = deps.session_factory or _default_session_factory()
+    session = session_factory()
 
     try:
         calendar = (deps.calendar_factory or _exchange_calendar)(arguments.calendar)
@@ -350,17 +496,35 @@ def main(
 
         print(format_preflight(report))
         mismatch = report.reconciliation.requires_halt
+        plans = build_plan_source(
+            arguments,
+            settings,
+            broker,
+            session,
+            session_factory,
+            calendar,
+            report.symbols,
+            alerts,
+            now,
+            refresh_data=deps.refresh_data,
+        )
 
         if arguments.check_only:
+            market_status = report.market
+            preview = plans.build_plan(
+                market_status.current_session or market_status.next_session
+            )
+            print(format_plan(preview))
             return EXIT_RECONCILIATION_MISMATCH if mismatch else EXIT_OK
 
         jobs = ExecutionJobs(
             service,
-            NoOrderPlan(),
+            plans,
             alerts,
             request_log=(
                 (lambda: broker.request_log) if hasattr(broker, "request_log") else None
             ),
+            protection=plans,
         )
         daemon = ExecutionDaemon(market, jobs, alerts=alerts, now=now)
 
@@ -414,6 +578,26 @@ def _configure_output(level: str) -> None:
     handler.setFormatter(formatter)
     logging.basicConfig(level=getattr(logging, level), handlers=[handler], force=True)
     logging.getLogger("alembic").setLevel(logging.WARNING)
+
+
+def _yahoo_refresher(session_factory: Callable[[], Session]) -> DataRefresher:
+    """Ingesta de Yahoo hasta el cierre de la señal (reanuda desde lo guardado)."""
+
+    def refresh(symbols: Sequence[str], end: date) -> None:
+        from algo_trading.cli.ingest import DEFAULT_START, run_ingestion
+        from algo_trading.data.providers.yfinance import YFinanceProvider
+
+        results = run_ingestion(
+            symbols, DEFAULT_START, end, YFinanceProvider(), session_factory
+        )
+        failed = [result.symbol for result in results if result.error]
+
+        if failed:
+            logging.getLogger(__name__).warning(
+                "Ingesta fallida para %s: sin señal de esos símbolos", ", ".join(failed)
+            )
+
+    return refresh
 
 
 def _default_session_factory() -> Callable[[], Session]:

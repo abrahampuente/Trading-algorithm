@@ -325,7 +325,23 @@ Reconciliación: OK; posiciones broker: ninguna
 - El aviso de datos es correcto: `algo-ingest` ingiere por defecto hasta ayer en UTC, así que la barra del viernes no entra hasta el sábado. El pipeline en vivo deberá ingerir el cierre del día antes de calcular señales.
 - No se ha probado todavía el modo continuo contra los servicios reales (sí con Ctrl+C simulado en tests).
 
-Pendiente en el Hito 4: plan de órdenes desde las señales del cierre (ingesta del día, señales, allocator con el equity del broker, planificador); notificaciones Telegram / Discord; persistir alertas, métricas y latencias; primera sesión completa en paper con el mercado abierto.
+Pipeline de señales a órdenes (`execution/pipeline.py`):
+
+- `SignalEngine`: señales del cierre `t` (última sesión cerrada) desde `market_bars_adjusted` con el mismo generador del backtest (`MomentumBreakoutGenerator`, v1). Carga el historial completo: el ATR de Wilder es recursivo y con una ventana de 120 días difería hasta un 0,6 % del backtest (PG y XOM, octubre de 2026); con el historial completo la `LongSignal` en vivo es idéntica a la del backtest (test de paridad). Un símbolo sin la barra de `t` no genera señal y se informa.
+- `SignalOrderPlanSource` (el `OrderPlanSource` del daemon): antes de cada apertura ingiere el cierre anterior (Yahoo, salvo `--skip-ingest`), escanea el universo, dimensiona con `PortfolioAllocator` usando el cash y las posiciones del broker (sin apalancamiento: no usa el poder de compra) y los valores bloqueados de la v1 (5 posiciones, 1 % de riesgo, SL 2 × ATR, TP 3 × ATR, exposición 20 %, perfil base), y genera las compras limitadas `OPG` con el escudo anti-gap (`Close[t] + 0,5 × ATR[t]`). El precio de entrada para el tamaño es `Close[t] · (1 + slippage)`. Sin señales, 0 órdenes; las posiciones abiertas se rechazan como `ALREADY_OPEN` (la v1 no rebalancea).
+- Protección: en cada sincronización intradía, las entradas del plan ya cerradas con ejecución reciben su OCO SL / TP sobre el precio medio ejecutado (`PROTECTIVE_EXIT_SUBMITTED`); las no ejecutadas (gap mayor que el límite) se descartan (`ENTRY_NOT_FILLED`). Las salidas de protección y las temporales se envían aunque la reconciliación haya bloqueado el envío (`allow_when_halted`): el bloqueo impide abrir posiciones, no proteger las existentes. Las entradas pendientes están en memoria; tras un reinicio, `post_close` alerta las posiciones sin OCO (`UNPROTECTED_POSITIONS`, crítica).
+- Alertas nuevas: `PLAN_GENERATED` (órdenes, rechazos, símbolos sin datos, equity; WARNING si hay datos desfasados) y `ORDER_FILLED` por cada ejecución registrada.
+
+Notificaciones (`telemetry/notifiers.py`): `DiscordWebhookSink` y `TelegramSink` (urllib, timeout 5 s, sin reintentos); filtro por nivel mínimo (WARNING) o código (`PLAN_GENERATED`, `ORDER_FILLED`, `PROTECTIVE_EXIT_SUBMITTED`, `DAILY_SUMMARY`, arranque y parada del daemon). Un fallo nunca interrumpe el trading ni muestra secretos en el log. Se activan con `DISCORD_WEBHOOK_URL` o `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` en `.env` (sección `notifications` en `local.yaml`); hoy no están configurados, sólo hay alertas en el log.
+
+CLI: `--check-only` muestra además el plan de la próxima sesión con los datos guardados (sin ingerir ni enviar); `--plan-only` genera y notifica el plan diario sin enviar entradas; `--skip-ingest` no ingiere antes del plan.
+
+Validación real (2026-10-23 22:19 UTC):
+
+- `algo-ingest --universe diversified --end 2026-10-23`: barra del viernes ingerida en los 15 símbolos (1712 sesiones). El test de regresión v1 usa el periodo fijo hasta 2026-10-22 y no cambia.
+- `algo-live --check-only`: datos al día, reconciliación OK, plan para 2026-10-26 con 0 órdenes (ninguna señal v1 en el cierre del viernes). Comprobación del motor sobre datos reales: 11 señales en las 38 sesiones del 2026-09-01 al 2026-10-23 (la última, PG el 2026-10-22).
+
+Pendiente en el Hito 4: salidas temporales (20 sesiones) en el plan diario; persistir las entradas pendientes de protección, alertas y métricas; configurar Discord o Telegram; primera sesión completa en paper con el mercado abierto.
 
 
 ## v1 cerrada (2026-10-23)

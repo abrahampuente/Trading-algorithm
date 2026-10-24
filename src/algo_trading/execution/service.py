@@ -165,8 +165,15 @@ class ExecutionService:
         """Desbloquea el envío; hágalo sólo tras revisar el desajuste."""
         self._halt_reason = None
 
-    def submit(self, request: OrderRequest) -> DispatchResult:
-        if self._halt_reason is not None:
+    def submit(
+        self, request: OrderRequest, allow_when_halted: bool = False
+    ) -> DispatchResult:
+        """
+        `allow_when_halted` sólo para órdenes que reducen riesgo (salidas de
+        protección): el bloqueo por reconciliación impide abrir posiciones,
+        no proteger las que ya existen.
+        """
+        if self._halt_reason is not None and not allow_when_halted:
             raise TradingHaltedError(
                 f"Envío bloqueado ({request.client_order_id}): {self._halt_reason}"
             )
@@ -222,14 +229,16 @@ class ExecutionService:
         return self.submit(
             self._planner.exit_order(
                 planned.candidate.symbol, quantity, levels, session_date
-            )
+            ),
+            allow_when_halted=True,
         )
 
     def dispatch_time_exit(
         self, symbol: str, quantity: int, session_date: date
     ) -> DispatchResult:
         return self.submit(
-            self._planner.time_exit_order(symbol, quantity, session_date)
+            self._planner.time_exit_order(symbol, quantity, session_date),
+            allow_when_halted=True,
         )
 
     def sync(self, client_order_id: str) -> OrderSyncResult:
@@ -260,6 +269,14 @@ class ExecutionService:
 
         self._broker.cancel_order(stored.broker_order_id)
         return self.sync(client_order_id)
+
+    def open_orders(self) -> tuple[OrderState, ...]:
+        """Órdenes no finales guardadas en MySQL (incluidas patas)."""
+        return self._repository.list_open()
+
+    def order_state(self, client_order_id: str) -> OrderState | None:
+        """Último estado guardado en MySQL (sin consultar al broker)."""
+        return self._repository.get(client_order_id)
 
     def order_records(
         self, since: datetime | None = None

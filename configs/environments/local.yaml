@@ -97,6 +97,12 @@ broker:
   max_attempts: 3
   gap_threshold_atr: 0.5       # límite de la compra OPG: Close + 0.5 x ATR
 
+# Notificaciones v2 (Hito 4). Secretos sólo en .env: DISCORD_WEBHOOK_URL,
+# TELEGRAM_BOT_TOKEN y TELEGRAM_CHAT_ID. Sin ellos, sólo hay alertas en el log.
+notifications:
+  min_level: WARNING          # además de los códigos de la lista por defecto
+  timeout_seconds: 5
+
 # Filtros de régimen v2 (desactivados por defecto; se activan desde la CLI con
 # --use-sector-relative-strength y --vix-filter-threshold).
 signals:

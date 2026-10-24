@@ -417,15 +417,28 @@ class OrderPlanSource(Protocol):
     def orders_for_session(self, session: TradingSession) -> Sequence[OrderRequest]: ...
 
 
+class ProtectionHook(Protocol):
+    """Salidas de protección de las entradas ejecutadas (ver `pipeline`)."""
+
+    def protect_filled_entries(
+        self, service: ExecutionService, session_date: date
+    ) -> Sequence[Any]: ...
+
+    def unprotected_positions(self, service: ExecutionService) -> Sequence[str]: ...
+
+
 class ExecutionJobs:
     """
     Tareas del daemon sobre `ExecutionService`:
 
     - `pre_open`: envía las órdenes del plan de la sesión (no envía nada si la
       reconciliación bloqueó el envío; lo alerta).
-    - `intraday`: sincroniza órdenes y fills abiertos.
-    - `post_close`: reconcilia y publica las métricas operativas del día
-      (slippage, latencia acumulada de la API y tasa de ejecución).
+    - `intraday`: sincroniza órdenes y fills abiertos, alerta cada ejecución
+      (`ORDER_FILLED`) y, con `protection`, envía las OCO SL / TP de las
+      entradas ya ejecutadas.
+    - `post_close`: reconcilia, alerta posiciones sin OCO de protección y
+      publica las métricas operativas del día (slippage, latencia acumulada
+      de la API y tasa de ejecución).
     """
 
     def __init__(
@@ -435,9 +448,11 @@ class ExecutionJobs:
         alerts: AlertEmitter,
         latency: LatencyTracker | None = None,
         request_log: Callable[[], Sequence[Any]] | None = None,
+        protection: ProtectionHook | None = None,
     ) -> None:
         self._service = service
         self._plans = plans
+        self._protection = protection
         self._alerts = alerts
         self._latency = latency or LatencyTracker()
         self._request_log = request_log
@@ -467,11 +482,41 @@ class ExecutionJobs:
         )
 
     def intraday(self, session: TradingSession) -> None:
-        self._service.sync_open_orders()
+        for result in self._service.sync_open_orders():
+            for execution in result.executions:
+                self._alerts.emit(
+                    AlertLevel.INFO,
+                    "ORDER_FILLED",
+                    f"{execution.client_order_id}: {execution.quantity} a "
+                    f"{execution.price}",
+                    {
+                        "client_order_id": execution.client_order_id,
+                        "quantity": str(execution.quantity),
+                        "price": str(execution.price),
+                        "cumulative_quantity": str(execution.cumulative_quantity),
+                        "status": result.status.value,
+                    },
+                )
+
+        if self._protection is not None:
+            self._protection.protect_filled_entries(self._service, session.session_date)
+
         self._refresh_latency()
 
     def post_close(self, session: TradingSession) -> None:
         self.last_reconciliation = self._service.reconcile_positions(self._alerts)
+
+        if self._protection is not None:
+            unprotected = self._protection.unprotected_positions(self._service)
+
+            if unprotected:
+                self._alerts.emit(
+                    AlertLevel.CRITICAL,
+                    "UNPROTECTED_POSITIONS",
+                    "Posiciones sin OCO de protección: " + ", ".join(unprotected),
+                    {"symbols": list(unprotected)},
+                )
+
         self._refresh_latency()
         self.last_metrics = operational_metrics(
             self._service.order_records(), self._latency.timings

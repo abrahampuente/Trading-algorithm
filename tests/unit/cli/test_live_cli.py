@@ -27,6 +27,7 @@ def at(day: date, hour: int, minute: int = 0) -> datetime:
 
 
 SATURDAY_NOON = at(date(2026, 10, 24), 12)
+REFRESHES: list[tuple[tuple[str, ...], date]] = []
 
 
 class FakeCalendar:
@@ -117,6 +118,8 @@ def dependencies(
         calendar_factory=lambda name: FakeCalendar(),
         expected_revision=lambda: revision,
         now=lambda: now or SATURDAY_NOON,
+        # Nunca red en tests: la ingesta de Yahoo se sustituye por un registro.
+        refresh_data=lambda symbols, end: REFRESHES.append((tuple(symbols), end)),
     )
 
 
@@ -349,3 +352,48 @@ def test_freshness_against_the_last_closed_session(engine: Engine) -> None:
     assert freshness.stale == {"MSFT": date(2026, 10, 22)}
     assert freshness.missing == ("XOM",)
     assert not freshness.is_current
+
+
+# --- Plan diario en la CLI -------------------------------------------------
+
+
+def test_check_only_previews_the_next_session_plan_without_ingesting(
+    engine: Engine, capsys: pytest.CaptureFixture[str]
+) -> None:
+    REFRESHES.clear()
+    deps = dependencies(engine, FakeBroker()).model_copy(update={"refresh_data": None})
+
+    code = live.main(["--check-only"], deps)
+
+    output = capsys.readouterr().out
+    assert code == live.EXIT_OK
+    assert (
+        "Plan para 2026-10-26 (señales del cierre 2026-10-23): 0 órdenes OPG" in output
+    )
+    assert "sin datos del cierre (no generan señal)" in output
+    assert REFRESHES == []
+
+
+def test_once_before_the_open_ingests_and_builds_the_plan(
+    engine: Engine, capsys: pytest.CaptureFixture[str]
+) -> None:
+    REFRESHES.clear()
+    broker = FakeBroker()
+
+    code = live.main(
+        ["--once", "--plan-only"], dependencies(engine, broker, now=at(MONDAY, 13, 20))
+    )
+
+    assert code == live.EXIT_OK
+    assert "pre_open OK" in capsys.readouterr().out
+    ((symbols, end),) = REFRESHES
+    assert end == date(2026, 10, 23)
+    assert len(symbols) == 15
+    assert broker.submitted == []
+
+
+def test_skip_ingest_flag() -> None:
+    arguments = live.parse_args(["--skip-ingest", "--plan-only"])
+
+    assert arguments.skip_ingest
+    assert arguments.plan_only
